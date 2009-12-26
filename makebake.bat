@@ -1,0 +1,1 @@
+bakefile -f msvc bakefile.bkl

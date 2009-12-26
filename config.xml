@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<NiNeo>
+    <!--Dont edit this file!-->
+    <Ident Username="newblue" Email="newblue@gmail.com" Signautre="" />
+    <ServerList>
+        <Server Label="localhost" Address="localhost" Port="119" Username="admin" Password="123" />
+        <Server Label="Cn99" Address="news.cn99.com" Port="119" Username="" Password="" />
+    </ServerList>
+    <GroupList>
+        <Group Server="localhost" Name="本站站务.公告" />
+        <Group Server="localhost" Name="本站站务.站务讨论" />
+        <Group Server="localhost" Name="alt.comp.google" />
+        <Group Server="localhost" Name="cn.fan" />
+        <Group Server="localhost" Name="alt.comp.lang.learn.c-c++" />
+        <Group Server="localhost" Name="精华信区.计算机软件" />
+        <Group Server="localhost" Name="科学技术.自然科学.医学.心理咨询" />
+    </GroupList>
+    <Setup />
+</NiNeo>

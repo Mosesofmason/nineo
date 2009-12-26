@@ -1,0 +1,3047 @@
+message threading.
+ 1997-2002 Jamie Zawinski <jwz@jwz.org> 
+
+
+
+--------------------------------------------------------------------------------
+
+
+In this document, I describe what is, in my humble but correct opinion, the best known algorithm for threading messages (that is, grouping messages together in parent/child relationships based on which messages are replies to which others.) This is the threading algorithm that was used in Netscape Mail and News 2.0 and 3.0, and in Grendel. 
+
+My Java implementation of this algorithm is available in the Grendel source. Sadly, my C implementation of this algorithm is not available, because it was purged during the 4.0 rewrite, and Netscape refused to allow me to free the 3.0 source code. 
+
+This is not the algorithm that Netscape 4.x uses, because this is another area where the 4.0 team screwed the pooch, and instead of just continuing to use the existing working code, replaced it with something that was bloated, slow, buggy, and incorrect. But hey, at least it was in C++ and used databases! 
+
+This algorithm is also described in the imapext-thread Internet Draft: Mark Crispin and Kenneth Murchison formalized my description of this algorithm, and propose it as the THREAD extension to the IMAP protocol (the idea being that the IMAP server could give you back a list of messages in a pre-threaded state, so that it wouldn't need to be done on the client side.) If you find my description of this algorithm confusing, perhaps their restating of it will be more to your taste. 
+
+I'm told this algorithm is also used in the Evolution and Balsa mail readers. Also, Simon Cozens and Richard Clamp have written a Perl version. (I've not tested any of these implementations, so I make no claims as to how faithfully they implement it.) 
+
+
+
+--------------------------------------------------------------------------------
+
+
+First some background on the headers involved. 
+
+In-Reply-To: 
+The In-Reply-To header was originally defined by RFC 822, the 1982 standard for mail messages. In 2001, its definition was tightened up by RFC 2822. 
+
+RFC 822 defined the In-Reply-To header as, basically, a free-text header. The syntax of it allowed it to contain basically any text at all. The following is, literally, a legal RFC 822 In-Reply-To header: 
+
+
+In-Reply-To: thirty-five ham and cheese sandwiches 
+So you're not guaranteed to be able to parse anything useful out of In-Reply-To if it exists, and even if it contains something that looks like a Message-ID, it might not be (especially since Message-IDs and email addresses have identical syntax.) 
+
+However, most of the time, In-Reply-To headers do have something useful in them. Back in 1997, I grepped over a huge number of messages and collected some damned lies, I mean, statistics, on what kind of In-Reply-To headers they contained. The results: 
+
+In a survey of 22,950 mail messages with In-Reply-To headers: 
+
+ 
+          18,396  had at least one occurrence of <>-bracketed text. 
+4,554  had no <>-bracketed text at all (just names and dates.) 
+714  contained one <>-bracketed addr-spec and no message IDs. 
+4  contained multiple message IDs. 
+1  contained one message ID and one <>-bracketed addr-spec. 
+
+The most common forms of In-Reply-To seemed to be: 
+
+ 
+31%  NAME's message of TIME <ID@HOST> 
+22%  <ID@HOST> 
+9%  <ID@HOST> from NAME at "TIME" 
+8%  USER's message of TIME <ID@HOST> 
+7%  USER's message of TIME 
+6%  Your message of "TIME" 
+17%  hundreds of other variants (average 0.4% each?) 
+
+
+Of course these numbers are very much dependent on the sample set, which, in this case, was probably skewed toward Unix users, and/or toward people who had been on the net for quite some time (due to the age of the archives I checked.) 
+
+However, this seems to indicate that it's not unreasonable to assume that, if there is an In-Reply-To field, then the first <>-bracketed text found therein is the Message-ID of the parent message. It is safe to assume this, that is, so long as you still exhibit reasonable behavior when that assumption turns out to be wrong, which will happen a small-but-not-insignificant portion of the time. 
+
+RFC 2822, the successor to RFC 822, updated the definition of In-Reply-To: by the more modern standard, In-Reply-To may contain only message IDs. There will usually be only one, but there could be more than one: these are the IDs of the messages to which this one is a direct reply (the idea being that you might be sending one message in reply to several others.) 
+
+
+References: 
+The References header was defined by RFC 822 in 1982. It was defined in, effectively, the same way as the In-Reply-To header was defined: which is to say, its definition was pretty useless. (Like In-Reply-To, its definition was also tightened up in 2001 by RFC 2822.) 
+
+However, the References header was also defined in 1987 by RFC 1036 (section 2.2.5), the standard for USENET news messages. That definition was much tighter and more useful than the RFC 822 definition: it asserts that this header contain a list of Message-IDs listing the parent, grandparent, great-grandparent, and so on, of this message, oldest first. That is, the direct parent of this message will be the last element of the References header. 
+
+It is not guaranteed to contain the entire tree back to the root-most message in the thread: news readers are allowed to truncate it at their discretion, and the manner in which they truncate it (from the front, from the back, or from the middle) is not defined. 
+
+Therefore, while there is useful info in the References header, it is not uncommon for multiple messages in the same thread to have seemingly-contradictory References data, so threading code must make an effort to do the right thing in the face of conflicting data. 
+
+RFC 2822 updated the mail standard to have the same semantics of References as the news standard, RFC 1036. 
+
+In practice, if you ever see a References header in a mail message, it will follow the RFC 1036 (and RFC 2822) definition rather than the RFC 822 definition. Because the References header both contains more information and is easier to parse, many modern mail user agents generate and use the References header in mail instead of (or in addition to) In-Reply-To, and use the USENET semantics when they do so. 
+
+You will generally not see In-Reply-To in a news message, but it can occasionally happen, usually as a result of mail/news gateways. 
+
+So, any sensible threading software will have the ability to take both In-Reply-To and References headers into account. 
+
+Note: RFC 2822 (section 3.6.4) says that a References field should contain the contents of the parent message's References field, followed by the contents of the parent's Message-ID field (in other words, the References field should contain the path through the thread.) However, I've been informed that recent versions of Eudora violate this standard: they put the parent Message-ID in the In-Reply-To header, but do not duplicate it in the References header: instead, the References header contains the grandparent, great-grand-parent, etc. 
+
+This implies that to properly reconstruct the thread of a message in the face of this nonstandard behavior, we need to append any In-Reply-To message IDs to References. 
+
+
+
+--------------------------------------------------------------------------------
+
+
+The Algorithm
+This algorithm consists of five main steps, and each of those steps is somewhat complicated. However, once you've wrapped your brain around it, it's not really that complicated, considering what it does. 
+
+In defense of its complexity, I can say this: 
+
+This algorithm is incredibly robust in the face of garbage input, and even in the face of malicious input (you cannot construct a set of inputs that will send this algorithm into a loop, for example.) 
+
+This algorithm has been field-tested by something on the order of ten million users over the course of six years. 
+
+It really does work incredibly well. I've never seen it produce results that were anything less than totally reasonable. 
+Well, enough with the disclaimers. 
+
+
+
+--------------------------------------------------------------------------------
+
+
+Definitions: 
+
+A Container object is composed of: 
+
+Message message;            // (may be null) 
+Container parent;   
+Container child;  // first child  
+Container next;  // next element in sibling list, or null 
+
+
+A Message object only has a few fields we are interested in: 
+
+String subject;             
+ID message_id;  // the ID of this message  
+ID *references;  // list of IDs of parent messages  
+
+The References field is populated from the ``References'' and/or ``In-Reply-To'' headers. If both headers exist, take the first thing in the In-Reply-To header that looks like a Message-ID, and append it to the References header. 
+
+If there are multiple things in In-Reply-To that look like Message-IDs, only use the first one of them: odds are that the later ones are actually email addresses, not IDs. 
+
+These ID objects can be strings, or they can be any other token on which you can do meaningful equality comparisons. 
+
+Only two things need to be done with the subject strings: ask whether they begin with ``Re:'', and compare the non-Re parts for equivalence. So you can get away with interning or otherwise hashing these, too. (This is a very good idea: my code does this so that I can use == instead of strcmp inside the loop.) 
+
+The ID objects also don't need to be strings, for the same reason. They can be hashes or numeric indexes or anything for which equality comparisons hold, so it's way faster if you can do pointer-equivalence comparisons instead of strcmp. 
+
+The reason the Container and Message objects are separate is because the Container fields are only needed during the act of threading: you don't need to keep those around, so there's no point in bulking up every Message structure with them. 
+
+
+The id_table is a hash table associating Message-IDs with Containers. 
+
+An ``empty container'' is one that doesn't have a message in it, but which shows evidence of having existed. For whatever reason, we don't have that message in our list (maybe it is expired or canceled, maybe it was deleted from the folder, or any of several other reasons.) 
+At presentation-time, these will show up as unselectable ``parent'' containers, for example, if we have the thread 
+
+
+      -- A
+         |-- B
+         \-- C
+      -- D
+
+and we know about messages B and C, but their common parent A does not exist, there will be a placeholder for A, to group them together, and prevent D from seeming to be a sibling of B and C. 
+These ``dummy'' messages only ever occur at depth 0. 
+
+The Algorithm: 
+
+
+For each message: 
+
+If id_table contains an empty Container for this ID: 
+Store this message in the Container's message slot. 
+Else: 
+Create a new Container object holding this message; 
+Index the Container by Message-ID in id_table. 
+
+For each element in the message's References field: 
+
+Find a Container object for the given Message-ID: 
+If there's one in id_table use that; 
+Otherwise, make (and index) one with a null Message. 
+
+Link the References field's Containers together in the order implied by the References header. 
+If they are already linked, don't change the existing links. 
+Do not add a link if adding that link would introduce a loop: that is, before asserting A->B, search down the children of B to see if A is reachable, and also search down the children of A to see if B is reachable. If either is already reachable as a child of the other, don't add the link. 
+
+Set the parent of this message to be the last element in References. Note that this message may have a parent already: this can happen because we saw this ID in a References field, and presumed a parent based on the other entries in that field. Now that we have the actual message, we can be more definitive, so throw away the old parent and use this new one. Find this Container in the parent's children list, and unlink it. 
+Note that this could cause this message to now have no parent, if it has no references field, but some message referred to it as the non-first element of its references. (Which would have been some kind of lie...) 
+
+Note that at all times, the various ``parent'' and ``child'' fields must be kept inter-consistent. 
+
+
+Find the root set. 
+Walk over the elements of id_table, and gather a list of the Container objects that have no parents. 
+
+
+Discard id_table. We don't need it any more. 
+
+Prune empty containers. 
+Recursively walk all containers under the root set. 
+For each container: 
+If it is an empty container with no children, nuke it. 
+Note: Normally such containers won't occur, but they can show up when two messages have References lines that disagree. For example, assuming A and B are messages, and 1, 2, and 3 are references for messages we haven't seen: 
+
+
+A has references: 1, 2, 3
+B has references: 1, 3 
+There is ambiguity as to whether 3 is a child of 1 or of 2. So, depending on the processing order, we might end up with either 
+
+
+      -- 1
+         |-- 2
+             \-- 3
+                 |-- A
+                 \-- B
+or 
+      -- 1
+         |-- 2            <--- non root childless container!
+         \-- 3
+             |-- A
+             \-- B
+
+If the Container has no Message, but does have children, remove this container but promote its children to this level (that is, splice them in to the current child list.) 
+Do not promote the children if doing so would promote them to the root set -- unless there is only one child, in which case, do. 
+
+
+Group root set by subject. 
+If any two members of the root set have the same subject, merge them. This is so that messages which don't have References headers at all still get threaded (to the extent possible, at least.) 
+
+Construct a new hash table, subject_table, which associates subject strings with Container objects. 
+
+For each Container in the root set: 
+
+Find the subject of that sub-tree: 
+If there is a message in the Container, the subject is the subject of that message. 
+If there is no message in the Container, then the Container will have at least one child Container, and that Container will have a message. Use the subject of that message instead. 
+Strip ``Re:'', ``RE:'', ``RE[5]:'', ``Re: Re[4]: Re:'' and so on. 
+If the subject is now "", give up on this Container. 
+Add this Container to the subject_table if: 
+There is no container in the table with this subject, or 
+This one is an empty container and the old one is not: the empty one is more interesting as a root, so put it in the table instead. 
+The container in the table has a ``Re:'' version of this subject, and this container has a non-``Re:'' version of this subject. The non-re version is the more interesting of the two. 
+
+Now the subject_table is populated with one entry for each subject which occurs in the root set. Now iterate over the root set, and gather together the difference. 
+For each Container in the root set: 
+
+
+Find the subject of this Container (as above.) 
+Look up the Container of that subject in the table. 
+If it is null, or if it is this container, continue. 
+
+Otherwise, we want to group together this Container and the one in the table. There are a few possibilities: 
+
+If both are dummies, append one's children to the other, and remove the now-empty container. 
+
+If one container is a empty and the other is not, make the non-empty one be a child of the empty, and a sibling of the other ``real'' messages with the same subject (the empty's children.) 
+
+If that container is a non-empty, and that message's subject does not begin with ``Re:'', but this message's subject does, then make this be a child of the other. 
+
+If that container is a non-empty, and that message's subject begins with ``Re:'', but this message's subject does not, then make that be a child of this one -- they were misordered. (This happens somewhat implicitly, since if there are two messages, one with Re: and one without, the one without will be in the hash table, regardless of the order in which they were seen.) 
+
+Otherwise, make a new empty container and make both msgs be a child of it. This catches the both-are-replies and neither-are-replies cases, and makes them be siblings instead of asserting a hierarchical relationship which might not be true. 
+(People who reply to messages without using ``Re:'' and without using a References line will break this slightly. Those people suck.) 
+
+(It has occurred to me that taking the date or message number into account would be one way of resolving some of the ambiguous cases, but that's not altogether straightforward either.) 
+
+
+Now you're done threading!
+Specifically, you no longer need the ``parent'' slot of the Container object, so if you wanted to flush the data out into a smaller, longer-lived structure, you could reclaim some storage as a result. 
+
+Now, sort the siblings.
+At this point, the parent-child relationships are set. However, the sibling ordering has not been adjusted, so now is the time to walk the tree one last time and order the siblings by date, sender, subject, or whatever. This step could also be merged in to the end of step 4, above, but it's probably clearer to make it be a final pass. If you were careful, you could also sort the messages first and take care in the above algorithm to not perturb the ordering, but that doesn't really save anything. 
+
+
+--------------------------------------------------------------------------------
+
+
+You might be wondering what Netscape Confusicator 4.0 broke. Well, basically they never got threading working right. Aside from crashing, corrupting their databases files, and general bugginess, the fundamental problem had been twofold: 
+
+
+4.0 eliminated the ``dummy thread parent'' step, which is an absolute necessity to get threading right in the case where you don't have every message (e.g., because one has expired, or was never sent to you at all.) The best explanation I was able to get from them for why they did this was, ``it looked ugly and I didn't understand why it was there.'' 
+
+4.0 eliminated the ``group similar unthreaded subjects'' step, which is necessary to get some semblance of threading right in the absence of References and In-Reply-To, or in the presence of mangled References. If there was no References header, 4.0 just didn't thread at all. 
+Plus my pet peeve, 
+
+
+The 4.0 UI presented threading as a kind of sorting, which is just not the case. Threading is the act of presenting parent/child relationships, whereas sorting is the act of ordering siblings. 
+That is, 4.0 gives you these choices: ``Sort by Date; Sort by Subject; Sort by message number; or Thread.'' Where they assume that ``Thread'' implies ``Sort by Date.'' So that means that there's no way to see a threaded set of messages that are sorted by message number, or by sender, etc. 
+
+There should be options for how to sort the messages; and then, orthogonal to that should be the boolean option of whether the messages should be threaded. 
+
+I seem to recall there being some other problem that was a result of the thread hierarchy being stored in the database, instead of computed as needed in realtime (there were was some kind of ordering or stale-data issue that came up?) but maybe they finally managed to fix that. 
+
+My C version of this code was able to thread 10,000 messages in less than half a second on a low-end (90 MHz) Pentium, so the argument that it has to be in the database for efficiency is pure bunk. 
+
+Also bunk is the idea that databases are needed for ``scalability.'' This code can thread 100,000 messages without a horrible delay, and the fact is, if you're looking at a 100,000 message folder (or for that matter, if you're running Confusicator at all), you're doing so on a machine that has sufficient memory to hold these structures in core. Also consider the question of whether your GUI toolkit contains a list/outliner widget that can display a million elements in the first place. (The answer is probably ``no.'') Also consider whether you have ever in your life seen a single folder that has a million messages in it, and that further, you've wanted to look at all at once (rather than only looking at the most recent 100,000 messages to arrive in that newsgroup...) 
+
+In short, all the arguments I've heard for using databases to implement threading and mbox summarization are solving problems that simply don't exist. Show me a real-world situation where the above technique actually falls down, and then we'll talk. 
+
+Just say no to databases! 
+
+
+
+--------------------------------------------------------------------------------
+
+
+[原创] 如何用数据库保存多级结构的数据 
+
+--------------------------------------------------------------------------------
+ 
+http://www.chinaunix.net 作者:shukebeita  发表于：2006-06-28 11:41:44 
+【发表评论】【查看原文】【Php讨论区】【关闭】  
+
+老有人提这样的问题，还有人不断的展示自己的代码声称支持无限分类等等，为了帮助刚入门的爱好者找到实用的方案，特地贡献一篇。但是文章太长而且有很多的代码这里贴起来不太方便，欢迎大家到下面地址阅读。 
+
+http://php.linuxpack.net/show.php?type=studyphp&id=1073542478 
+
+如果有什么建议或者疑问，发在这里吧。  
+
+:lol:
+
+
+
+--------------------------------------------------------------------------------
+ mikespook 回复于：2004-01-08 15:28:19
+
+收获颇多~~~ 
+
+子孙总数=（左-右-1）/2 
+
+虽然一直知道这个事实可是一直都不知道这玩意有什么用~~ 
+
+打印出来，值得慢慢读！
+
+
+--------------------------------------------------------------------------------
+ tonera 回复于：2004-01-08 15:28:26
+
+收了，支持你写书！ :D
+
+
+--------------------------------------------------------------------------------
+ 夜猫子 回复于：2004-01-08 22:22:22
+
+产品分类，多级的树状结构的论坛，邮件列表等许多地方我们都会遇到这样的问题：如何存储多级结构的数据？在PHP的应用中，提供后台数据存储的通常是关系型数据库，它能够保存大量的数据，提供高效的数据检索和更新服务。然而关系型数据的基本形式是纵横交错的表，是一个平面的结构，如果要将多级树状结构存储在关系型数据库里就需要进行合理的翻译工作。接下来我会将自己的所见所闻和一些实用的经验和大家探讨一下：  
+
+层级结构的数据保存在平面的数据库中基本上有两种常用设计方法：  
+
+1、毗邻目录模式(adjacency list model)  
+
+2、预排序遍历树算法(modified preorder tree traversal algorithm)  
+
+我不是计算机专业的，也没有学过什么数据结构的东西，所以这两个名字都是我自己按照字面的意思翻的，如果说错了还请多多指教。  
+这两个东西听着好像很吓人，其实非常容易理解。这里我用一个简单食品目录作为我们的示例数据。  
+
+我们的数据结构是这样的  
+
+以下是代码：  
+
+Food
+|
+|---Fruit
+|    |
+|    |---Red
+|    |    |
+|    |    |--Cherry
+|    |
+|    |---Yellow
+|          |
+|          |--Banana
+|
+|---Meat
+     |
+     |--Beef
+     |
+     |--Pork
+
+
+
+为了照顾那些英文一塌糊涂的PHP爱好者  
+Food:食物  
+Fruit:水果  
+Red:红色  
+Cherry:樱桃  
+Yellow:黄色  
+Banana:香蕉  
+Meat:肉类  
+Beef:牛肉  
+Pork:猪肉  
+
+
+毗邻目录模式(adjacency list model)  
+这种模式我们经常用到，很多的教程和书中也介绍过。我们通过给每个节点增加一个属性 parent 来表示这个节点的父节点从而将整个树状结构通过平面的表描述出来。根据这个原则，例子中的数据可以转化成如下的表：  
+
+以下是代码：  
+
++-----------------------+
+|   parent |    name    |
++-----------------------+
+|          |    Food    |
+|   Food   |   Fruit    |
+|   Fruit  |    Green   |
+|   Green  |    Pear    |
+|   Fruit  |    Red     |
+|   Red    |    Cherry  |
+|   Fruit  |    Yellow  |
+|   Yellow |    Banana  |
+|   Food   |    Meat    |
+|   Meat   |    Beef    |
+|   Meat   |    Pork    |
++-----------------------+
+
+
+
+
+我们看到 Pear 是Green的一个子节点，Green是Fruit的一个子节点。而根节点'Food'没有父节点。 为了简单地描述这个问题， 这个例子中只用了name来表示一个记录。 在实际的数据库中，你需要用数字的id来标示每个节点，数据库的表结构大概应该像这样：id, parent_id, name, description。  
+有了这样的表我们就可以通过数据库保存整个多级树状结构了。  
+
+显示多级树  
+如果我们需要显示这样的一个多级结构需要一个递归函数。  
+
+以下是代码：  
+
+<?php
+// $parent is the parent of the children we want to see
+// $level is increased when we go deeper into the tree,
+//        used to display a nice indented tree
+
+function display_children($parent, $level) 
+{
+   // 获得一个 父节点 $parent 的所有子节点
+   $result = mysql_query('SELECT name FROM tree '.
+                          'WHERE parent="'.$parent.'";');
+
+   // 显示每个子节点
+   while ($row = mysql_fetch_array($result)) 
+   {
+       // 缩进显示节点名称
+       echo str_repeat('  ',$level).$row['name']."n";
+
+       //再次调用这个函数显示子节点的子节点
+      
+       display_children($row['name'], $level+1);
+   }
+}
+?>;
+
+
+
+对整个结构的根节点（Food）使用这个函数就可以打印出整个多级树结构，由于Food是根节点它的父节点是空的，所以这样调用: display_children('',0)。将显示整个树的内容：  
+
+Food 
+Fruit 
+ Red 
+  Cherry 
+ Yellow 
+  Banana 
+Meat 
+ Beef 
+ Pork 
+
+
+如果你只想显示整个结构中的一部分，比如说水果部分，就可以这样调用：display_children('Fruit',0);  
+
+几乎使用同样的方法我们可以知道从根节点到任意节点的路径。比如 Cherry 的路径是　"Food >; Fruit >; Red"。 为了得到这样的一个路径我们需要从最深的一级"Cherry"开始， 查询得到它的父节点"Red"把它添加到路径中， 然后我们再查询Red的父节点并把它也添加到路径中，以此类推直到最高层的"Food"  
+
+以下是代码：  
+
+<?php
+// $node 是那个最深的节点
+function get_path($node) 
+{
+   // 查询这个节点的父节点
+   $result = mysql_query('SELECT parent FROM tree '.
+                          'WHERE name="'.$node.'";');
+   $row = mysql_fetch_array($result);
+
+   // 用一个数组保存路径
+   $path = array();
+
+   // 如果不是根节点则继续向上查询
+   // (根节点没有父节点)
+   if ($row['parent']!='') 
+   {
+       // the last part of the path to $node, is the name
+       // of the parent of $node
+       $path[] = $row['parent'];
+
+       // we should add the path to the parent of this node
+       // to the path
+       $path = array_merge(get_path($row['parent']), $path);
+   }
+
+   // return the path
+   return $path;
+}
+?>;
+
+
+
+如果对"Cherry"使用这个函数：print_r(get_path('Cherry'))，就会得到这样的一个数组了：  
+
+Array 
+( 
+  [0] =>; Food 
+  [1] =>; Fruit 
+  [2] =>; Red 
+) 
+
+
+接下来如何把它打印成你希望的格式，就是你的事情了。  
+
+缺点：  
+这种方法很简单，容易理解，好上手。但是也有一些缺点。主要是因为运行速度很慢，由于得到每个节点都需要进行数据库查询，数据量大的时候要进行很多查询才能完成一个树。另外由于要进行递归运算，递归的每一级都需要占用一些内存所以在空间利用上效率也比较低。  
+
+现在让我们看一看另外一种不使用递归计算，更加快速的方法，这就是预排序遍历树算法(modified preorder tree traversal algorithm)  
+这种方法大家可能接触的比较少，初次使用也不像上面的方法容易理解，但是由于这种方法不使用递归查询算法，有更高的查询效率。  
+
+我们首先将多级数据按照下面的方式画在纸上，在根节点Food的左侧写上 1 然后沿着这个树继续向下 在 Fruit 的左侧写上 2 然后继续前进，沿着整个树的边缘给每一个节点都标上左侧和右侧的数字。最后一个数字是标在Food 右侧的 18。 在下面的这张图中你可以看到整个标好了数字的多级结构。（没有看懂？用你的手指指着数字从1数到18就明白怎么回事了。还不明白，再数一遍，注意移动你的手指）。  
+这些数字标明了各个节点之间的关系，"Red"的号是3和6，它是 "Food" 1-18 的子孙节点。 同样，我们可以看到 所有左值大于2和右值小于11的节点 都是"Fruit" 2-11 的子孙节点  
+
+以下是代码：  
+
+                                1 Food 18
+                                    |
+                +-------------------------------------------+
+                |                                                       |
+            2 Fruit 11                                    12 Meat 17
+                |                                                       |
+    +------------------------+                   +-----------------------+
+    |                                |                   |                              |
+ 3 Red 6               7 Yellow 10         13 Beef 14            15 Pork 16
+    |                                |
+4 Cherry 5               8 Banana 9
+
+
+
+这样整个树状结构可以通过左右值来存储到数据库中。继续之前，我们看一看下面整理过的数据表。  
+
+以下是代码：  
+
++-----------------------+-----+-----+
+|   parent |    name  | lft   | rgt |
++-----------------------+-----+-----+
+|              |    Food    | 1   | 18  |
+|   Food   |   Fruit      | 2   | 11  |
+|   Fruit    |    Red      | 3   |  6  |
+|   Red     |    Cherry  | 4   |  5  |
+|   Fruit    |    Yellow  | 7   | 10  |
+|   Yellow |    Banana | 8   |  9  |
+|   Food   |    Meat     | 12  | 17  |
+|   Meat   |    Beef     | 13  | 14  |
+|   Meat   |    Pork     | 15  | 16  |
++-----------------------+-----+-----+
+
+
+
+注意：由于"left"和"right"在 SQL中有特殊的意义，所以我们需要用"lft"和"rgt"来表示左右字段。 另外这种结构中不再需要"parent"字段来表示树状结构。也就是 说下面这样的表结构就足够了。  
+
+以下是代码：  
+
++------------+-----+-----+
+|    name    | lft | rgt |
++------------+-----+-----+
+|    Food    | 1   | 18  |
+|   Fruit    | 2   | 11  |
+|    Red     | 3   |  6  |
+|    Cherry  | 4   |  5  |
+|    Yellow  | 7   | 10  |
+|    Banana  | 8   |  9  |
+|    Meat    | 12  | 17  |
+|    Beef    | 13  | 14  |
+|    Pork    | 15  | 16  |
++------------+-----+-----+
+
+
+
+好了我们现在可以从数据库中获取数据了，例如我们需要得到"Fruit"项下的所有所有节点就可以这样写查询语句：  
+SELECT * FROM tree WHERE lft BETWEEN 2 AND 11;  
+这个查询得到了以下的结果。  
+
+以下是代码：  
+
++------------+-----+-----+
+|    name    | lft | rgt |
++------------+-----+-----+
+|   Fruit    | 2   | 11  |
+|    Red     | 3   |  6  |
+|    Cherry  | 4   |  5  |
+|    Yellow  | 7   | 10  |
+|    Banana  | 8   |  9  |
++------------+-----+-----+
+
+
+
+
+看到了吧，只要一个查询就可以得到所有这些节点。为了能够像上面的递归函数那样显示整个树状结构，我们还需要对这样的查询进行排序。用节点的左值进行排序：  
+
+SELECT * FROM tree WHERE lft BETWEEN 2 AND 11 ORDER BY lft ASC;  
+
+
+剩下的问题如何显示层级的缩进了。  
+
+以下是代码：  
+
+<?php
+function display_tree($root) 
+{
+   // 得到根节点的左右值
+   $result = mysql_query('SELECT lft, rgt FROM tree '.'WHERE name="'.$root.'";');
+   $row = mysql_fetch_array($result);
+
+   // 准备一个空的右值堆栈
+   $right = array();
+
+   // 获得根基点的所有子孙节点
+   $result = mysql_query('SELECT name, lft, rgt FROM tree '.
+                          'WHERE lft BETWEEN '.$row['lft'].' AND '.
+                          $row['rgt'].' ORDER BY lft ASC;');
+
+   // 显示每一行
+   while ($row = mysql_fetch_array($result)) 
+   {
+       // only check stack if there is one
+       if (count($right)>;0) 
+   {
+           // 检查我们是否应该将节点移出堆栈
+           while ($right[count($right)-1]<$row['rgt']) 
+   {
+               array_pop($right);
+           }
+       }
+
+       // 缩进显示节点的名称
+       echo str_repeat('  ',count($right)).$row['name']."n";
+
+       // 将这个节点加入到堆栈中
+       $right[] = $row['rgt'];
+   }
+}
+?>;
+
+
+
+如果你运行一下以上的函数就会得到和递归函数一样的结果。只是我们的这个新的函数可能会更快一些，因为只有2次数据库查询。  
+
+要获知一个节点的路径就更简单了，如果我们想知道Cherry 的路径就利用它的左右值4和5来做一个查询。  
+
+SELECT name FROM tree WHERE lft < 4 AND rgt >; 5 ORDER BY lft ASC;  
+
+这样就会得到以下的结果：  
+
+以下是代码：  
+
++------------+
+|    name    |
++------------+
+|   Food     |
+|   Fruit    |
+|    Red     |
++------------+
+
+
+
+那么某个节点到底有多少子孙节点呢？很简单，子孙总数=(右值-左值-1)/2  
+descendants = (right – left - 1) / 2  
+不相信？自己算一算啦。  
+用这个简单的公式，我们可以很快的算出"Fruit 2-11"节点有4个子孙节点，而"Banana 8-9"节点没有子孙节点，也就是说它不是一个父节点了。  
+
+很神奇吧？虽然我已经多次用过这个方法，但是每次这样做的时候还是感到很神奇。  
+
+这的确是个很好的办法，但是有什么办法能够帮我们建立这样有左右值的数据表呢？这里再介绍一个函数给大家，这个函数可以将name和parent结构的表自动转换成带有左右值的数据表。  
+
+以下是代码：  
+
+<?php
+function rebuild_tree($parent, $left) {
+   // the right value of this node is the left value + 1
+   $right = $left+1;
+
+   // get all children of this node
+   $result = mysql_query('SELECT name FROM tree '.
+                          'WHERE parent="'.$parent.'";');
+   while ($row = mysql_fetch_array($result)) {
+       // recursive execution of this function for each
+       // child of this node
+       // $right is the current right value, which is
+       // incremented by the rebuild_tree function
+       $right = rebuild_tree($row['name'], $right);
+   }
+
+   // we've got the left value, and now that we've processed
+   // the children of this node we also know the right value
+   mysql_query('UPDATE tree SET lft='.$left.', rgt='.
+                $right.' WHERE name="'.$parent.'";');
+
+   // return the right value of this node + 1
+   return $right+1;
+}
+?>;
+
+
+
+当然这个函数是一个递归函数，我们需要从根节点开始运行这个函数来重建一个带有左右值的树  
+
+rebuild_tree('Food',1);  
+
+这个函数看上去有些复杂，但是它的作用和手工对表进行编号一样，就是将立体多层结构的转换成一个带有左右值的数据表。  
+
+那么对于这样的结构我们该如何增加，更新和删除一个节点呢？  
+
+增加一个节点一般有两种方法：  
+
+第一种，保留原有的name 和parent结构，用老方法向数据中添加数据，每增加一条数据以后使用rebuild_tree函数对整个结构重新进行一次编号。  
+
+第二种，效率更高的办法是改变所有位于新节点右侧的数值。举例来说：我们想增加一种新的水果"Strawberry"（草莓）它将成为"Red"节点的最后一个子节点。首先我们需要为它腾出一些空间。"Red"的右值应当从6改成8，"Yellow 7-10 "的左右值则应当改成 9-12。 依次类推我们可以得知，如果要给新的值腾出空间需要给所有左右值大于5的节点 （5 是"Red"最后一个子节点的右值） 加上2。 所以我们这样进行数据库操作：  
+
+UPDATE tree SET rgt=rgt+2 WHERE rgt>;5;  
+UPDATE tree SET lft=lft+2 WHERE lft>;5;  
+
+这样就为新插入的值腾出了空间，现在可以在腾出的空间里建立一个新的数据节点了， 它的左右值分别是6和7  
+
+INSERT INTO tree SET lft=6, rgt=7, name='Strawberry';  
+
+再做一次查询看看吧！怎么样？很快吧。  
+
+好了，现在你可以用两种不同的方法设计你的多级数据库结构了，采用何种方式完全取决于你个人的判断，但是对于层次多数量大的结构我更喜欢第二种方法。如果查询量较小但是需要频繁添加和更新的数据，则第一种方法更为简便。  
+
+另外，如果数据库支持的话 你还可以将rebuild_tree()和 腾出空间的操作写成数据库端的触发器函数， 在插入和更新的时候自动执行， 这样可以得到更好的运行效率， 而且你添加新节点的SQL语句会变得更加简单。
+
+
+--------------------------------------------------------------------------------
+ shukebeita 回复于：2004-01-08 22:30:18
+
+能不能把那些图表对对齐，尤其是那个代标号的树状图，否则大家看不懂了。
+
+
+--------------------------------------------------------------------------------
+ longnetpro 回复于：2004-01-09 03:38:53
+
+好！shukebeita这个写得好！代码都不用看，就看你那个表和查询就知道思路了，可能比原来那个树型解决方案还要好！不过看起来暂时只是二叉树，还不是真正的任意形状的树，还得研究一阵子。 
+
+另外：shukebeita的两个翻译不准，现在我来翻译一下（主要对英文欠缺或是无专业背景人士） 
+1、adjacency list model   -  邻接表模式  
+注：adjacent list 术语为邻接表，好象是（好多年了，忘了很多）指主干节点拖的一个尾巴，与邻接矩阵有关。总之好象是每个节点都横竖两条双向链表中间，总体上被链成一个矩阵，每个节点是矩阵中的一个元素。 
+
+2、modified preorder tree traversal algorithm  -  修改过的先序遍历树算法（亦即先根遍历树算法） 
+注：modified  意为“修改过的” 
+preorder tree traversal  专业术语“先序遍历树”，preorder是“先于...的顺序”的意思，pre- 是词前缀，意为“先”，order 意为“顺序”；traversal是“遍历的”的意思。 
+整个算法的原则是： 
+从树根开始处理该树的所有节点，处理方法为—— 
+先处理当前的节点，然后递归处理当前节点的左子节点，然后再递归处理当前节点的右子节点，如果子节点为NULL（没有节点）的话即返回。写成代码的话，一般形式为： 
+
+
+function preorder(&$node, $level = 0){  // 注意是传递引用，C中也就是传递指针
+    process_root($node);  // 处理本节点
+   $n =& $node->;left;  // 引用赋值，以便作为参数传递
+   if ($n != null){  // 如果左子节点不为空
+        preorder($n, level + 1);  // 递归处理左子节点，同时层数加一
+   }
+     $n =& $node->;right;  // 引用赋值，以便作为参数传递
+   if ($n != null){  // 如果右子节点不为空
+        preorder($n, level + 1);  // 递归处理右子节点，同时层数加一
+   }
+}
+
+
+
+
+以上之所以加了几个判断是为了防止多一次无意义的递归，引用赋值主要是减少PHP中的复制开销（PHP5是会好一些）。 
+
+而外部调用一般要先定义一个入口函数，再调用递归函数，形式如下： 
+
+
+
+function call_preorder(){
+    $root =& $tree->;root; // 引用赋值，将树的根作为遍历的入口点
+   $level = 0;  // 树根是0级
+    preorder($root, $level);  // 然后从树根开始遍历
+}
+
+
+
+
+递归函数中有一个函数是process(&$node)，用于处理该节点$node，可以实现任何你想实现的功能，如打印此节点的关键字值等。
+
+
+--------------------------------------------------------------------------------
+ longnetpro 回复于：2004-01-09 03:59:47
+
+刚才突然发现一个问题，就是这个水果顺列是已插入好的顺列，所以查找起来用这个方法可以，但是如果是随机插入节点的话，虽然在查询的时候不用递归了，但建树的时候还要用到递归，而且每次插入预留两个空不太灵活，有时也会影响到计算所有子节点的数目，因为数据库操作写入可能会写错。 
+
+最主要的是目前暂只适用于二叉树，不适合于多叉树。 
+
+不过这个问题值得研究一番。
+
+
+--------------------------------------------------------------------------------
+ shukebeita 回复于：2004-01-09 09:33:28
+
+引用：原帖由 "longnetpro" 发表：
+2、modified preorder tree traversal algorithm - 修改过的先序遍历树算法（亦即先根遍历树算法） 
+注：modified 意为“修改过的” 
+preorder tree traversal 专业术语“先序遍历树”，preorder是“先于...的顺序”的意思，pre- 是词前缀，意为“先”，order 意为“顺序”；
+
+
+多谢支持，这些方法也是我从外国的书里学到的，我的确不太懂这些术语，不过我对 modified preorder tree traversal algorithm 这一句还是有我的想法。 
+
+1、我不是计算级或者数学专业的，单是从字面上理解我想大概有一种算法叫做preorder tree traversal algorithm ，而这里用到的是它的一个修改版本，所以称其为modified。 
+
+2、pre是先的意思没错，但是order在这里更准确地说应该是排序，排定顺序的意思。所以就是说这个树是“预先排好序号“的树。 
+
+引用： 
+ 最主要的是目前暂只适用于二叉树，不适合于多叉树。  
+
+
+不知道你说的多叉树是不是说像下面的样子 
+
+                                1 Food 20
+                                    |
+                +-------------------------------------------+
+                |                         |                             |
+            2 Fruit 11     12  Vegetable 13    14 Meat 19
+                |                                                       |
+    +------------------------+                   +-----------------------+
+    |                                |                   |                              |
+3 Red 6               7 Yellow 10         15 Beef 16            17 Pork 18
+    |                                |
+4 Cherry 5               8 Banana 9 
+
+
+如果是这样的话，你完全可以放心，这种办法没有问题，一样适用。我已经试过多次。 
+
+
+引用：但建树的时候还要用到递归
+
+所以这种方法对于经常需要查询，但是很少增加和更新的数据（比如产品，书籍的多级分类）更为合适，一旦建立很少变动。 
+
+引用：有时也会影响到计算所有子节点的数目，因为数据库操作写入可能会写错。 
+
+这就是需要transaction(事务处理)的地方了。
+
+
+--------------------------------------------------------------------------------
+ longnetpro 回复于：2004-01-09 11:56:36
+
+别的你说的都能理解，也很容易理解。 
+
+多叉树从排序情况看是一样的，但是的确插入和更新就比较麻烦了，虽说只用到少数几个UPDATE，但是改动却是大范围的。看来什么方法都不能十全十美的。 
+
+有一点必须指出，preorder肯定是你理解错误，“预先排好序号”这个意思完全与遍历无关，与它的算法原理也一点都不相合。 
+
+首先要搞清楚遍历的意思。遍历是将一个拓朴结构上所有的节点根据一种算法按顺序全都处理到——注意是所有的节点。遍历是一个过程，在遍历的过程中，按一定的顺序处理各个节点。 
+
+preorder 遍历就是“先序遍历”，也叫“先根遍历”，之所以这样说是因为先序遍历在对子节点进行递归遍历之前先处理根节点。inorder遍历是“中序遍历”，也叫“中根遍历”，因为中序遍历是先对左子节点递归遍历，然后处理根节点，然后再对右子节点进行递归遍历。postorder遍历是“后序遍历”，也叫“后根遍历”，是左右子节点都遍历排完了最后再处理根节点。 
+
+其实我对这个英文也理解有点误，但是术语肯定是“先序”这个意思，现在想起来可能中文意思与英文原意有差别。当时学的时候就是“先序”“前序”这种说法，但到底表示什么也不是很清楚。现在想来应该是这样的：preorder应该是“在排序之前”，inorder是“在排序之中”，postorder是“在排序之后”，就和“战前”，“战后”的拼词方法类似。可能总体上理解就是“当前节点的处理在排序（即递归遍历）之前的遍历算法”，“当前节点的处理在排序（即递归遍历）之中的遍历算法”，“当前节点的处理在排序（即递归遍历）之后的遍历算法”。
+
+
+--------------------------------------------------------------------------------
+ tonera 回复于：2004-04-25 15:35:37
+
+今天终于遇到关于多级分类查询和数据设计的问题了。再次认真看了一遍楼主的文章，真是恍然大悟、茅塞顿开啊。我没读多少书，没学过离散数学，呵呵。我觉得这个问题实在讨论得太有意义了。 
+
+这个问题其实并不只是PHP的问题，更多的是数据设计的问题，精巧的数据结构实在太重要了。 
+
+我开始也只想到用递归来处理，但效率实在太差。层次越多，效率越低。如果用先序遍历树算法(modified preorder tree traversal algorithm) 。则相对来说，层次越多，表现越好。呵呵呵呵。 :D  
+
+唯一不爽的就是在编辑节点时比较麻烦。 
+shuke，能不能抽空写个树构造类，以后大家都用这个算啦。呵呵。 :D  
+我试试看能不能完成，等我搞好了再贴。
+
+
+--------------------------------------------------------------------------------
+ raffles 回复于：2005-01-14 13:50:03
+
+http://php.linuxpack.net/show.php?type=studyphp&id=1073542478  
+
+看不了!?????????????????????
+
+
+--------------------------------------------------------------------------------
+ 夜猫子 回复于：2005-01-14 14:26:56
+
+我已经转贴过来了，上边我发的那个帖子就是
+
+
+--------------------------------------------------------------------------------
+ aspbiz 回复于：2005-01-14 15:15:00
+
+树形结构不难吧。 
+
+一些基本的东东。
+
+
+--------------------------------------------------------------------------------
+ 夜猫子 回复于：2005-01-14 15:33:53
+
+那是因为你知道得太少
+
+
+--------------------------------------------------------------------------------
+ jhsea3do 回复于：2005-01-14 22:16:11
+
+实用性文章，顶！
+
+
+--------------------------------------------------------------------------------
+ SATAND 回复于：2005-01-15 01:33:48
+
+关于标记任意的级别数据，我还是赞同采取编码标记法 
+比如，每级数据为四位数，饱合值9999，在编号存取方面，采用VChar值 
+“Num.”四位作为前缀，之后是一级编码，二级编码，三级编码。。。比如一条信息在第四级13号，那其编号就是“Num.0001000100010013” 
+递归列树则基础于检索时的条件限制，例如用“Num.xxxx%”作为关键字检索第一级的所有数据量，如果要把某一类置于另一个父类，只需要检索“Num.xxxxxxxx...”将前面的“Num.xxxx...”替换为父类的ID就OK了 
+另，有两点需要注意： 
+第一，这张数据表要有一个Max值表辅助，也就是要通过一个Max值，来记录每一个类已经存储的最大值； 
+第二，删除数据时不能真的删除，而是打上删除标记，在插入新纪录时update，有效的节约资源 
+
+本标记看似采用大数标记，其实属字串操作，不会耗太多的CPU资源，而设定索引后，配合左端定制右边通配符的条件检索，可以获得很高的效率 
+
+以上是偶在做某集团财务应用时采用的分公司标记法，这样，当某家分公司被调整时，可以很方便的实现大挪移。 
+
+声明，上面的讨论没有细读，是否文不对题的嫌疑...请指正 
+
+
+http://newsy.org/news/news/SATAND/tech/2005-01-15/1105724453.html
+
+
+--------------------------------------------------------------------------------
+ lichen 回复于：2005-01-17 15:15:19
+
+老大是不是连接更改了，怎么打不开呐？？？？
+
+
+--------------------------------------------------------------------------------
+ fire-phoenix 回复于：2006-06-27 13:29:25
+
+引用：原帖由 shukebeita 于 2004-1-8 14:34 发表 
+老有人提这样的问题，还有人不断的展示自己的代码声称支持无限分类等等，为了帮助刚入门的爱好者找到实用的方案，特地贡献一篇。但是文章太长而且有很多的代码这里贴起来不太方便，欢迎大家到下面地址阅读。 
+
+h ... 
+
+url已经失效了.:(
+
+
+--------------------------------------------------------------------------------
+ ipaddr 回复于：2006-06-27 20:42:59
+
+这么老的帖,都有人翻出来. 
+
+这种算法,优化查询,但是对写入,修改就比较麻烦. 
+
+可以根据实际情况采用.
+
+
+--------------------------------------------------------------------------------
+ yanjing5462 回复于：2006-06-28 11:41:44
+
+对于多级分类的处理,采用先序遍历确实加快了查询速度. 
+分类的添加毕竟没有查询那么频繁,所以这种方法值得推荐 
+
+只是不太明白如查我想得到Fruit下边的一级目录Red,Yellow怎么处理?毕竟得到下一级分类是经常用到的
+
+
+
+ 
+ 
+
+原文链接：http://bbs.chinaunix.net/viewthread.php?tid=239532
+转载请注明作者名及原文出处
+
+
+ 
+ 
+先根遍历树算法(modified preorder tree traversal algorith)
+2006-1-20 16:55:00   [ Author: hubro | Web&Program ] 
+Tags:
+
+--------------------------------------------------------------------------------
+
+Font Size: Big Middle Small
+　层级结构的数据保存在平面的数据库中基本上有两种常用设计方法： 
+　 
+　1、毗邻目录模式(adjacency list model) 
+　 
+　2、预排序遍历树算法(modified preorder tree traversal algorithm) 
+　第一种是常用的,层之间的关系用一个路径和父ID来示,一般都是用的这个方法 
+　这个就不用多说了 
+　 
+　现在来讲第二种,比起第一种,它的查询时间更短,但插入时却费时一些 
+　原文地址 
+　http://www.chinaunix.net/jh/27/239532.html 
+　内空是按PHP写的,不过意思都一样,明白这个道理就行了 
+　[quote] 
+　我们首先将多级数据按照下面的方式画在纸上，在根节点Food的左侧写上 1 然后沿着这个树继续向下 在 Fruit 的左侧写上 2 然后继续前进，沿着整个树的边缘给每一个节点都标上左侧和右侧的数字。最后一个数字是标在Food 右侧的 18。 在下面的这张图中你可以看到整个标好了数字的多级结构。（没有看懂？用你的手指指着数字从1数到18就明白怎么回事了。还不明白，再数一遍，注意移动你的手指）。 
+　这些数字标明了各个节点之间的关系，"Red"的号是3和6，它是 "Food" 1-18 的子孙节点。 同样，我们可以看到 所有左值大于2和右值小于11的节点 都是"Fruit" 2-11 的子孙节点 
+　 
+　以下是代码： 
+　 
+　                               1 Food 18 
+　                                   | 
+　               +-------------------------------------------+ 
+　               |                                           | 
+　           2 Fruit 11                                    12 Meat 17 
+　               |                                           | 
+　   +------------------------+                   +-----------------------+ 
+　   |                        |                   |                       | 
+　3 Red 6               7 Yellow 10         13 Beef 14            15 Pork 16 
+　   |                        | 
+　4 Cherry 5               8 Banana 9 
+　 
+　 
+　这样整个树状结构可以通过左右值来存储到数据库中。继续之前，我们看一看下面整理过的数据表。 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　+-----------------------+-----+-----+ 
+　| parent         | name | lft | rgt | 
+　+-----------------------+-----+-----+ 
+　|                | Food | 1   | 18  | 
+　| Food           | Fruit| 2   | 11  | 
+　| Fruit          | Red  | 3   | 6   | 
+　| Red            |Cherry| 4   | 5   | 
+　| Fruit          |Yellow| 7   | 10  | 
+　| Yellow         |Banana| 8   | 9   | 
+　| Food           | Meat | 12  | 17  | 
+　| Meat           | Beef | 13  | 14  | 
+　| Meat           | Pork | 15  | 16  | 
+　+-----------------------+-----+-----+ 
+　[/code:1:86c003e7bb] 
+　 
+　注意：由于"left"和"right"在 SQL中有特殊的意义，所以我们需要用"lft"和"rgt"来表示左右字段。 另外这种结构中不再需要"parent"字段来表示树状结构。也就是 说下面这样的表结构就足够了。 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　+------------+-----+-----+ 
+　| name       | lft | rgt | 
+　+------------+-----+-----+ 
+　| Food       | 1   | 18  | 
+　| Fruit      | 2   | 11  | 
+　| Red        | 3   | 6   | 
+　| Cherry     | 4   | 5   | 
+　| Yellow     | 7   | 10  | 
+　| Banana     | 8   | 9   | 
+　| Meat       | 12  | 17  | 
+　| Beef       | 13  | 14  |  
+　| Pork       | 15  | 16  | 
+　+------------+-----+-----+ 
+　[/code:1:86c003e7bb] 
+　 
+　好了我们现在可以从数据库中获取数据了，例如我们需要得到"Fruit"项下的所有所有节点就可以这样写查询语句： 
+　SELECT * FROM tree WHERE lft BETWEEN 2 AND 11; 
+　这个查询得到了以下的结果。 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　+------------+-----+-----+ 
+　| name       | lft | rgt | 
+　+------------+-----+-----+ 
+　| Fruit      | 2   | 11  | 
+　| Red        | 3   | 6   | 
+　| Cherry     | 4   | 5   | 
+　| Yellow     | 7   | 10  | 
+　| Banana     | 8   | 9   | 
+　+------------+-----+-----+ 
+　[/code:1:86c003e7bb] 
+　 
+　 
+　看到了吧，只要一个查询就可以得到所有这些节点。为了能够像上面的递归函数那样显示整个树状结构，我们还需要对这样的查询进行排序。用节点的左值进行排序： 
+　 
+　SELECT * FROM tree WHERE lft BETWEEN 2 AND 11 ORDER BY lft ASC; 
+　 
+　 
+　剩下的问题如何显示层级的缩进了。 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　<?php 
+　function display_tree($root) 
+　{ 
+　 // 得到根节点的左右值 
+　 $result = mysql_query('SELECT lft, rgt FROM tree '.'WHERE name="'.$root.'";'); 
+　 $row = mysql_fetch_array($result); 
+　 
+　 // 准备一个空的右值堆栈 
+　 $right = array(); 
+　 
+　 // 获得根基点的所有子孙节点 
+　 $result = mysql_query('SELECT name, lft, rgt FROM tree '. 
+　 'WHERE lft BETWEEN '.$row['lft'].' AND '. 
+　 $row['rgt'].' ORDER BY lft ASC;'); 
+　 
+　 // 显示每一行 
+　 while ($row = mysql_fetch_array($result)) 
+　 { 
+　 // only check stack if there is one 
+　 if (count($right)>0) 
+　 { 
+　 // 检查我们是否应该将节点移出堆栈 
+　 while ($right[count($right)-1]<$row['rgt']) 
+　 { 
+　 array_pop($right); 
+　 } 
+　 } 
+　 
+　 // 缩进显示节点的名称 
+　 echo str_repeat(' ',count($right)).$row['name']."n"; 
+　 
+　 // 将这个节点加入到堆栈中 
+　 $right[] = $row['rgt']; 
+　 } 
+　} 
+　?> 
+　[/code:1:86c003e7bb] 
+　 
+　如果你运行一下以上的函数就会得到和递归函数一样的结果。只是我们的这个新的函数可能会更快一些，因为只有2次数据库查询。 
+　 
+　要获知一个节点的路径就更简单了，如果我们想知道Cherry 的路径就利用它的左右值4和5来做一个查询。 
+　 
+　SELECT name FROM tree WHERE lft < 4 AND rgt > 5 ORDER BY lft ASC; 
+　 
+　这样就会得到以下的结果： 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　+------------+ 
+　| name | 
+　+------------+ 
+　| Food | 
+　| Fruit | 
+　| Red | 
+　+------------+ 
+　[/code:1:86c003e7bb] 
+　 
+　那么某个节点到底有多少子孙节点呢？很简单，子孙总数=(右值-左值-1)/2 
+　descendants = (right – left - 1) / 2 
+　不相信？自己算一算啦。 
+　用这个简单的公式，我们可以很快的算出"Fruit 2-11"节点有4个子孙节点，而"Banana 8-9"节点没有子孙节点，也就是说它不是一个父节点了。 
+　 
+　很神奇吧？虽然我已经多次用过这个方法，但是每次这样做的时候还是感到很神奇。 
+　 
+　这的确是个很好的办法，但是有什么办法能够帮我们建立这样有左右值的数据表呢？这里再介绍一个函数给大家，这个函数可以将name和parent结构的表自动转换成带有左右值的数据表。 
+　 
+　以下是代码： 
+　[code:1:86c003e7bb] 
+　<?php 
+　function rebuild_tree($parent, $left) { 
+　 // the right value of this node is the left value + 1 
+　 $right = $left+1; 
+　 
+　 // get all children of this node 
+　 $result = mysql_query('SELECT name FROM tree '. 
+　 'WHERE parent="'.$parent.'";'); 
+　 while ($row = mysql_fetch_array($result)) { 
+　 // recursive execution of this function for each 
+　 // child of this node 
+　 // $right is the current right value, which is 
+　 // incremented by the rebuild_tree function 
+　 $right = rebuild_tree($row['name'], $right); 
+　 } 
+　 
+　 // we've got the left value, and now that we've processed 
+　 // the children of this node we also know the right value 
+　 mysql_query('UPDATE tree SET lft='.$left.', rgt='. 
+　 $right.' WHERE name="'.$parent.'";'); 
+　 
+　 // return the right value of this node + 1 
+　 return $right+1; 
+　} 
+　?> 
+　[/code:1:86c003e7bb] 
+　 
+　当然这个函数是一个递归函数，我们需要从根节点开始运行这个函数来重建一个带有左右值的树 
+　 
+　rebuild_tree('Food',1); 
+　 
+　这个函数看上去有些复杂，但是它的作用和手工对表进行编号一样，就是将立体多层结构的转换成一个带有左右值的数据表。 
+　 
+　那么对于这样的结构我们该如何增加，更新和删除一个节点呢？ 
+　 
+　增加一个节点一般有两种方法： 
+　 
+　第一种，保留原有的name 和parent结构，用老方法向数据中添加数据，每增加一条数据以后使用rebuild_tree函数对整个结构重新进行一次编号。 
+　 
+　第二种，效率更高的办法是改变所有位于新节点右侧的数值。举例来说：我们想增加一种新的水果"Strawberry"（草莓）它将成为"Red"节点的最后一个子节点。首先我们需要为它腾出一些空间。"Red"的右值应当从6改成8，"Yellow 7-10 "的左右值则应当改成 9-12。 依次类推我们可以得知，如果要给新的值腾出空间需要给所有左右值大于5的节点 （5 是"Red"最后一个子节点的右值） 加上2。 所以我们这样进行数据库操作： 
+　 
+　UPDATE tree SET rgt=rgt+2 WHERE rgt>5; 
+　UPDATE tree SET lft=lft+2 WHERE lft>5; 
+　 
+　这样就为新插入的值腾出了空间，现在可以在腾出的空间里建立一个新的数据节点了， 它的左右值分别是6和7 
+　 
+　INSERT INTO tree SET lft=6, rgt=7, name='Strawberry'; 
+　 
+　再做一次查询看看吧！怎么样？很快吧。 
+　 
+　好了，现在你可以用两种不同的方法设计你的多级数据库结构了，采用何种方式完全取决于你个人的判断，但是对于层次多数量大的结构我更喜欢第二种方法。如果查询量较小但是需要频繁添加和更新的数据，则第一种方法更为简便。 
+　 
+　另外，如果数据库支持的话 你还可以将rebuild_tree()和 腾出空间的操作写成数据库端的触发器函数， 在插入和更新的时候自动执行， 这样可以得到更好的运行效率， 而且你添加新节点的SQL语句会变得更加简单。 
+　 
+　
+
+在GooGle中搜索关于“先根遍历树算法(modified preorder tree traversal algorith)”的文章
+
+
+Url http://www.hubro.net/item/751
+TrackBack Addresshttp://www.hubro.net/TrackBack.aspx?trackback_id=751
+
+--------------------------------------------------------------------------------
+
+Comment:2 | Trackbacks:0 [Modify] 
+Trackback Ping
+
+
+Comment
+All Comments
+by cyz1980 at 2006-1-20 17:23:00 
+　基于关系数据库系统链式存储的树型结构数据，求某结点下的子树所有结点算法(t-sql语言实现，初稿) 
+　 
+　此算法代码虽然不是最好的、最合理的，但我认为它是合适与适用的。 
+　 
+　CREATE TABLE dpet ( --树型结构数据的数据存放表结构 
+　[dpcode] [varchar] (9) , --结点编码 
+　[dpname] [varchar] (20) , --结点名称 
+　[dpcode_p] [varchar] (9) --此结点的父结点编码 
+　) ON [PRIMARY] 
+　 
+　/*ms sql 2000调试通过,表temp,t,new,tt 结构与表dpet一致*/ 
+　 
+　CREATE PROCEDURE desc_dept(@dpcode varchar(9)) AS 
+　--树型结构数据，求某结点下的的子树所有结点 
+　 truncate table temp 
+　 truncate table t 
+　 truncate table tt 
+　 truncate table new 
+　 insert into temp select * from dpet --数据临时存放表 
+　 insert into t select * from temp where dpcode_p=@dpcode --中间临时表 
+　 insert into new select * from t --结果临时表 
+　 while (exists(select * from t where dpcode in (select dpcode_p from temp))) 
+　 --当某层的结点全为叶子时，才停止循环 
+　 begin 
+　 insert into tt select * from t --中间交换临时表 
+　 truncate tab... 
+
+[reply]
+
+by cyz1980 at 2006-1-20 17:24:00 
+　http://blog.csdn.net/cyz1980/archive/2006/01/14/579549.aspx 
+
+贪婪算法---最小耗费生成树[转载]  　　 
+ 
+
+点击“保存设置”按扭可使您本次阅读的整体设置（文字、字号、背景）得以保留，下次阅读时您就不必再重新设置，以符合您的阅读习惯。 
+ 
+　  .:.:1.3.6 贪婪算法---最小耗费生成树:.:.    
+ 
+       文字  黑色 白色 红色 灰色 绿色 蓝色 青色 黄色 背景  白色 黑色 粉红 灰色 绿色 蓝色 青色 综色 字号  9 pt 10 pt 12 pt 14 pt 16 pt 19 pt  保存设置     人气指数：25729    
+ 
+
+1.3.6 最小耗费生成树
+在例1 - 2及1 - 3中已考察过这个问题。因为具有n 个顶点的无向网络G的每个生成树刚好具有n-1条边，所以问题是用某种方法选择n-1条边使它们形成G的最小生成树。至少可以采用三种不同的贪婪策略来选择这n-1条边。这三种求解最小生成树的贪婪算法策略是： K r u s k a l算法，P r i m算法和S o l l i n算法。
+
+1. Kruskal算法
+
+(1) 算法思想
+
+K r u s k a l算法每次选择n- 1条边，所使用的贪婪准则是：从剩下的边中选择一条不会产生环路的具有最小耗费的边加入已选择的边的集合中。注意到所选取的边若产生环路则不可能形成一棵生成树。K r u s k a l算法分e 步，其中e 是网络中边的数目。按耗费递增的顺序来考虑这e 条边，每次考虑一条边。当考虑某条边时，若将其加入到已选边的集合中会出现环路，则将其抛弃，否则，将它选入。
+
+考察图1-12a 中的网络。初始时没有任何边被选择。图13-12b 显示了各节点的当前状态。边（ 1 , 6）是最先选入的边，它被加入到欲构建的生成树中，得到图1 3 - 1 2 c。下一步选择边（ 3，4）并将其加入树中（如图1 3 - 1 2 d所示）。然后考虑边( 2，7 )，将它加入树中并不会产生环路，于是便得到图1 3 - 1 2 e。下一步考虑边（ 2，3）并将其加入树中（如图1 3 - 1 2 f所示）。在其余还未考虑的边中，（7，4）具有最小耗费，因此先考虑它，将它加入正在创建的树中会产生环路，所以将其丢弃。此后将边（ 5，4）加入树中，得到的树如图13-12g 所示。下一步考虑边（ 7，5），由于会产生环路，将其丢弃。最后考虑边（ 6，5）并将其加入树中，产生了一棵生成树，其耗费为9 9。图1 - 1 3给出了K r u s k a l算法的伪代码。
+
+
+/ /在一个具有n 个顶点的网络中找到一棵最小生成树
+
+令T为所选边的集合，初始化T=
+
+令E 为网络中边的集合
+
+w h i l e(E≠ )&&(| T |≠n- 1 ) {
+
+令(u,v)为E中代价最小的边 E=E- { (u,v) } / /从E中删除边
+
+i f( (u,v)加入T中不会产生环路)将（ u,v）加入T
+
+}
+
+i f(| T | = =n-1) T是最小耗费生成树
+
+e l s e 网络不是互连的，不能找到生成树
+
+图13-13 Kruskao算法的伪代码
+
+
+(2) 正确性证明
+
+利用前述装载问题所用的转化技术可以证明图1 3 - 1 3的贪婪算法总能建立一棵最小耗费生成树。需要证明以下两点： 1) 只要存在生成树，K r u s k a l算法总能产生一棵生成树； 2) 产生的生成树具有最小耗费。令G为任意加权无向图（即G是一个无向网络）。从1 2 . 11 . 3节可知当且仅当一个无向图连通时它有生成树。而且在Kruskal 算法中被拒绝（丢弃）的边是那些会产生环路的边。删除连通图环路中的一条边所形成的图仍是连通图，因此如果G在开始时是连通的，则T与E中的边总能形成一个连通图。也就是若G开始时是连通的，算法不会终止于E= 和| T |< n- 1。
+
+现在来证明所建立的生成树T具有最小耗费。由于G具有有限棵生成树，所以它至少具有一棵最小生成树。令U为这样的一棵最小生成树， T与U都刚好有n- 1条边。如果T=U, 则T就具有最小耗费，那么不必再证明下去。因此假设T≠U，令k(k >0) 为在T中而不在U中的边的个数，当然k 也是在U中而不在T中的边的数目。 通过把U变换为T来证明U与T具有相同的耗费，这种转化可在k 步内完成。每一步使在T而不在U中的边的数目刚好减1。而且U的耗费不会因为转化而改变。经过k 步的转化得到的U将与原来的U具有相同的耗费，且转化后U中的边就是T中的边。由此可知， T具有最小耗费。每步转化包括从T中移一条边e 到U中，并从U中移出一条边f。边e 与f 的选取按如下方式进行：
+
+1) 令e 是在T中而不在U中的具有最小耗费的边。由于k >0，这条边肯定存在。
+
+2) 当把e 加入U时，则会形成唯一的一条环路。令f 为这条环路上不在T中的任意一条边。
+
+由于T中不含环路，因此所形成的环路中至少有一条边不在T中。
+
+从e 与f 的选择方法中可以看出， V=U+ {e} -{ f } 是一棵生成树，且T中恰有k- 1条边不在V中出现。现在来证明V的耗费与U的相同。显然，V的耗费等于U的耗费加上边e 的耗费再减去边f 的耗费。若e 的耗费比f 的小，则生成树V的耗费比U的耗费小，这是不可能的。如果e 的耗费高于f，在K r u s k a l算法中f 会在e 之前被考虑。由于f 不在T中，Kruskal 算法在考虑f 能否加入T时已将f 丢弃，因此f 和T中耗费小于或等于f 的边共同形成环路。通过选择e，所有这些边均在U中，因此U肯定含有环路，但是实际上这不可能，因为U是一棵生成树。e 的代价高于f 的假设将会导致矛盾。剩下的唯一的可能是e 与f 具有相同的耗费，由此可知V与U的耗费相同。
+
+(3) 数据结构的选择及复杂性分析
+
+为了按耗费非递减的顺序选择边，可以建立最小堆并根据需要从堆中一条一条地取出各边。当图中有e 条边时，需花(e) 的时间初始化堆及O ( l o ge) 的时间来选取每一条边。边的集合T与G中的顶点一起定义了一个由至多n 个连通子图构成的图。用顶点集合来描述每个子图，这些顶点集合没有公共顶点。为了确定边（ u,v）是否会产生环路，仅需检查u,v 是否在同一个顶点集中（即处于同一子图）。如果是，则会形成一个环路；如果不是，则不会产生环路。因此对于顶点集使用两个F i n d操作就足够了。当一条边包含在T中时，2个子图将被合并成一个子图，即对两个集合执行U n i o n操作。集合的F i n d和U n i o n操作可利用8 . 1 0 . 2节的树（以及加权规则和路径压缩）来高效地执行。F i n d操作的次数最多为2e，Un i o n操作的次数最多为n- 1（若网络是连通的，则刚好是n- 1次）。加上树的初始化时间，算法中这部分的复杂性只比O (n+e) 稍大一点。
+
+对集合T所执行的唯一操作是向T中添加一条新边。T可用数组t 来实现。添加操作在数组
+
+的一端进行，因为最多可在T中加入n- 1条边，因此对T的操作总时间为O (n)。
+
+总结上述各个部分的执行时间，可得图1 3 - 1 3算法的渐进复杂性为O (n+el o ge)。
+
+(4) 实现
+
+利用上述数据结构，图1 - 1 3可用C + +代码来实现。首先定义E d g e N o d e类（见程序1 3 - 6 )，它是最小堆的元素及生成树数组t 的数据类型。
+
+程序13-6 Kruskal算法所需要的数据类型
+
+template 
+
+class EdgeNode {
+
+p u b l i c :
+
+operator T() const {return weight;}
+
+p r i v a t e :
+
+T weight;//边的高度
+
+int u, v;//边的端点
+
+} ;
+
+为了更简单地使用8 . 1 0 . 2节的查找和合并策略，定义了U n i o n F i n d类，它的构造函数是程序8 - 1 6的初始化函数，U n i o n是程序8 - 1 6的加权合并函数，F i n d是程序8 - 1 7的路径压缩搜索函数。
+
+为了编写与网络描述无关的代码，还定义了一个新的类U N e t Wo r k，它包含了应用于无向网络的所有函数。这个类与U n d i r e c t e d类的差别在于U n d i r e c t e d类中的函数不要求加权边，而U N e t Wo r k要求边必须带有权值。U N e t Wo r k中的成员需要利用N e t w o r k类中定义的诸如B e g i n和N e x t Ve r t e x的遍历函数。不过，新的遍历函数不仅需要返回下一个邻接的顶点，而且要返回到达这个顶点的边的权值。这些遍历函数以及有向和无向加权网络的其他函数一起构成了W N e t w o r k类（见程序1 3 - 7）。
+
+程序13-7 WNetwork类
+
+template
+
+class WNetwork : virtual public Network
+
+{
+
+public :
+
+virtual void First(int i, int& j, T& c)=0;
+
+virtual void Next(int i, int& j, T& c)=0;
+
+} ;
+
+象B e g i n和N e x t Ve r t e x一样，可在A d j a c e n c y W D i g r a p h及L i n k e d W D i g r a p h类中加入函数F i r s t与N e x t。现在A d j a c e n c y W D i g r a p h及L i n k e d W D i g r a p h类都需要从W N e t Wo r k中派生而来。由于A d j a c e n c y W G r a p h类和L i n k e d W G r a p h类需要访问U N e t w o r k的成员，所以这两个类还必须从U N e t Wo r k中派生而来。U N e t Wo r k : : K r u s k a l的代码见程序1 3 - 8，它要求将Edges() 定义为N e t Work 类的虚成员，并且把U N e t Wo r k定义为E d g e N o d e的友元）。如果没有生成树，函数返回f a l s e，否则返回t r u e。注意当返回true 时，在数组t 中返回最小耗费生成树。
+
+程序13-8 Kr u s k a l算法的C + +代码
+
+template
+
+bool UNetwork::Kruskal(EdgeNode t[])
+
+{// 使用K r u s k a l算法寻找最小耗费生成树
+
+// 如果不连通则返回false
+
+// 如果连通，则在t [ 0 : n - 2 ]中返回最小生成树
+
+int n = Ve r t i c e s ( ) ;
+
+int e = Edges();
+
+/ /设置网络边的数组
+
+InitializePos(); // 图遍历器
+
+EdgeNode *E = new EdgeNode [e+1];
+
+int k = 0; // E的游标
+
+for (int i = 1; i <= n; i++) { // 使所有边附属于i
+
+int j;
+
+T c;
+
+First(i, j, c);
+
+while (j) { // j 邻接自i
+
+if (i < j) {// 添加到达E的边
+
+E[++k].weight = c;
+
+E[k].u = i;
+
+E[k].v = j;}
+
+Next(i, j, c);
+
+}
+
+}
+
+// 把边放入最小堆
+
+MinHeap > H(1);
+
+H.Initialize(E, e, e);
+
+UnionFind U(n); // 合并/搜索结构
+
+// 根据耗费的次序来抽取边
+
+k = 0; // 此时作为t的游标
+
+while (e && k < n - 1) {
+
+// 生成树未完成，尚有剩余边
+
+EdgeNode x;
+
+H.DeleteMin(x); // 最小耗费边
+
+e - - ;
+
+int a = U.Find(x.u);
+
+int b = U.Find(x.v);
+
+if (a != b) {// 选择边
+
+t[k++] = x;
+
+U . U n i o n ( a , b ) ; }
+
+}
+
+D e a c t i v a t e P o s ( ) ;
+
+H . D e a c t i v a t e ( ) ;
+
+return (k == n - 1);
+
+}
+
+2. Prim算法
+
+与Kr u s k a l算法类似，P r i m算法通过每次选择多条边来创建最小生成树。选择下一条边的贪婪准则是：从剩余的边中，选择一条耗费最小的边，并且它的加入应使所有入选的边仍是一棵树。最终，在所有步骤中选择的边形成一棵树。相反，在Kruskal 算法中所有入选的边集合最终形成一个森林。
+
+P r i m算法从具有一个单一顶点的树T开始，这个顶点可以是原图中任意一个顶点。然后往T中加入一条代价最小的边（ u , v）使Tè{ (u , v) }仍是一棵树，这种加边的步骤反复循环直到T中包含n- 1条边。注意对于边（ u , v），u、v 中正好有一个顶点位于T中。P r i m算法的伪代码如图1 -1 4所示。在伪代码中也包含了所输入的图不是连通图的可能，在这种情况下没有生成树。图1 - 1 5显示了对图1-12a 使用P r i m算法的过程。把图1 - 1 4的伪代码细化为C + +程序及其正确性的证明留作练习（练习3 1）。
+
+
+/ /假设网络中至少具有一个顶点
+
+设T为所选择的边的集合，初始化T=
+
+设T V为已在树中的顶点的集合，置T V= { 1 }
+
+令E为网络中边的集合
+
+w h i l e(E< > ) & & (| T | < > n-1) {
+
+令（u , v）为最小代价边，其中u T V, v T V
+
+i f（没有这种边） b re a k
+
+E=E- { (u,v) } / /从E中删除此边
+
+在T中加入边（ u , v）
+
+}
+
+if (| T | = =n- 1 ) T是一棵最小生成树
+
+else 网络是不连通的，没有最小生成树
+
+图13-14 Prim最小生成树算法
+
+
+如果根据每个不在T V中的顶点v 选择一个顶点n e ar (v)，使得n e ar (v) ? TV 且c o st (v, n e ar (v) )的值是所有这样的n e ar (v) 节点中最小的，则实现P r i m算法的时间复杂性为O (n2 )。下一条添加到T中的边是这样的边：其cost (v, near (v)) 最小，且v T V。
+
+3. Sollin算法
+
+S o l l i n算法每步选择若干条边。在每步开始时，所选择的边及图中的n个顶点形成一个生成树的森林。在每一步中为森林中的每棵树选择一条边，这条边刚好有一个顶点在树中且边的代价最小。将所选择的边加入要创建的生成树中。注意一个森林中的两棵树可选择同一条边，因此必须多次复制同一条边。当有多条边具有相同的耗费时，两棵树可选择与它们相连的不同的边，在这种情况下，必须丢弃其中的一条边。开始时，所选择的边的集合为空。若某一步结束时仅剩下一棵树或没有剩余的边可供选择时算法终止。
+
+图1 - 6给出了初始状态为图1-12a 时，使用S o l l i n算法的步骤。初始入选边数为0时的情形如图13-12a 时,森林中的每棵树均是单个顶点。顶点1，2，.，7所选择的边分别是(1.6), (2,7),(3,4), (4,3), (5,4), (6,1), (7,2)，其中不同的边是( 1 , 6 )，( 2 , 7 )，(3,4) 和( 5 , 4 )，将这些边加入入选边的集合后所得到的结果如图1 3 - 1 6 a所示。下一步具有顶点集{ 1 , 6 }的树选择边( 6 , 5 )，剩下的两棵树选择边( 2 , 3 )，加入这两条边后已形成一棵生成树，构建好的生成树见图1 3 - 6 b。S o l l i n算法的C + +程序实现及其正确性证明留作练习（练习3 2 )。
+
+ 
+ 
+ 
+无限级目录树最优算法的新研究 
+ 
+ 
+ 
+ 
+（首先声明：因为看到许多人对本文的热心关注，作者对本文稍作修改和补充）
+本文具体介绍：1。目录树的数据结构
+              2。探讨具体应用中数据库的查询复杂度。
+
+表结构：  id（编号）pid（父节点）nodepath（路径）nodetype（状态）
+ 
+示例数据：1         0             0>               F
+          2         0             0>               D
+          3         2             0>2>             D
+          4         3             0>2>3>           F
+测试项目：                                                    
+1。获取当前节点的父节点：复杂度:O(n)
+2。获取当前节点的下级子节点: 复杂度:O(n)
+3。获取当前节点的所有子孙节点: 复杂度:O(n)
+4。获取当前节点的所有直系祖宗节点: 复杂度:O(n)
+5。删除、新增节点时比较容易实现，主要是实现节点转移有点麻烦：设被转移
+
+的节点为S,转移到的目的节点为T,则S.nodepath=T.nodepath+T.id+'>';同时检
+
+查S是否有兄弟节点，无则S的父节点的nodetype改为F;检查T的nodetype，如为F
+
+则改为D；修改表中S的子孙节点nodepath。一般这种情况出现的几率很低。
+说明：本人的初衷是将该结构主要应用在类资源管理器的目录树中，根据
+
+nodetype，画树的时候不必再搜索数据库去判断该节点是否还有子节点。至于用
+
+在bbs帖子树，像帖子树中有一个帖子最新的，就必须将整个帖子树置顶这样的
+
+情况，有种实用解决办法：增加一个字段rootid(帖子的根帖):select distanct 
+
+rootid from table order by postdate。
+本数据结构支持无限级树，关于树的深度，可以根据实际情况而定nodepath的长
+
+度。最后，我为什么用“最优”，主要有激将之意，抛砖引玉，只是希望能引起
+
+广大高手的注意，能提出个人独特建议，在交流上作广泛的讨论。作者本人也绝
+
+没有夜郎自大的意思。
+
+Perl Thread
+
+class Thread
+{
+	Thread ( messages )
+	{}
+	thread ()
+	{
+		this->_setup ();
+	}
+	_setup ()
+	{
+		for ( message in messages )
+		{
+			cont  = this->_get_cont_for_id ( id of message );
+			cont << message;
+			refs = this->_references ( message );
+			var prev = 0;
+			for ( ref in refs )
+			{
+				cont = _get_cont_for_id ( ref );
+				if ( prev != 0 &&
+				     cont.parent != 0 &&
+				     cont.has_descendent ( prev ) )
+				     prev.add_child ( cont );
+				prev = cont;
+			}
+			//if ( prev != 0 )
+			 //  prev->add_child (this_container);
+		}
+	}
+	has_descendent ( prev )
+	{
+		-_- !!!
+	}
+	_msgid ( message )
+	{
+		return "Message-ID" in message;
+	}
+	_get_cont_for_id ( id )
+	{
+		find id in 'id_table';
+		return message || new container with id and return cont;
+	}
+	_references ( msg )
+	{
+		references = _get_hdr ( msg, "References");
+		foo = _get_hdr ( msg, "In-Reply-To");
+		
+		if ( foo =~ /^\S+\@\S+$/ &&
+		    (
+		      !references.empty() || references.last() != foo ))
+		references += foo ;
+		return UNIQ (references);
+	}
+}
+message threading.
+ 1997-2002 Jamie Zawinski <jwz@jwz.org> 
+
+
+
+--------------------------------------------------------------------------------
+
+
+In this document, I describe what is, in my humble but correct opinion, the best known algorithm for threading messages (that is, grouping messages together in parent/child relationships based on which messages are replies to which others.) This is the threading algorithm that was used in Netscape Mail and News 2.0 and 3.0, and in Grendel. 
+
+My Java implementation of this algorithm is available in the Grendel source. Sadly, my C implementation of this algorithm is not available, because it was purged during the 4.0 rewrite, and Netscape refused to allow me to free the 3.0 source code. 
+
+This is not the algorithm that Netscape 4.x uses, because this is another area where the 4.0 team screwed the pooch, and instead of just continuing to use the existing working code, replaced it with something that was bloated, slow, buggy, and incorrect. But hey, at least it was in C++ and used databases! 
+
+This algorithm is also described in the imapext-thread Internet Draft: Mark Crispin and Kenneth Murchison formalized my description of this algorithm, and propose it as the THREAD extension to the IMAP protocol (the idea being that the IMAP server could give you back a list of messages in a pre-threaded state, so that it wouldn't need to be done on the client side.) If you find my description of this algorithm confusing, perhaps their restating of it will be more to your taste. 
+
+I'm told this algorithm is also used in the Evolution and Balsa mail readers. Also, Simon Cozens and Richard Clamp have written a Perl version. (I've not tested any of these implementations, so I make no claims as to how faithfully they implement it.) 
+
+
+
+--------------------------------------------------------------------------------
+
+
+First some background on the headers involved. 
+
+In-Reply-To: 
+The In-Reply-To header was originally defined by RFC 822, the 1982 standard for mail messages. In 2001, its definition was tightened up by RFC 2822. 
+
+RFC 822 defined the In-Reply-To header as, basically, a free-text header. The syntax of it allowed it to contain basically any text at all. The following is, literally, a legal RFC 822 In-Reply-To header: 
+
+
+In-Reply-To: thirty-five ham and cheese sandwiches 
+So you're not guaranteed to be able to parse anything useful out of In-Reply-To if it exists, and even if it contains something that looks like a Message-ID, it might not be (especially since Message-IDs and email addresses have identical syntax.) 
+
+However, most of the time, In-Reply-To headers do have something useful in them. Back in 1997, I grepped over a huge number of messages and collected some damned lies, I mean, statistics, on what kind of In-Reply-To headers they contained. The results: 
+
+In a survey of 22,950 mail messages with In-Reply-To headers: 
+
+ 
+          18,396  had at least one occurrence of <>-bracketed text. 
+4,554  had no <>-bracketed text at all (just names and dates.) 
+714  contained one <>-bracketed addr-spec and no message IDs. 
+4  contained multiple message IDs. 
+1  contained one message ID and one <>-bracketed addr-spec. 
+
+The most common forms of In-Reply-To seemed to be: 
+
+ 
+31%  NAME's message of TIME <ID@HOST> 
+22%  <ID@HOST> 
+9%  <ID@HOST> from NAME at "TIME" 
+8%  USER's message of TIME <ID@HOST> 
+7%  USER's message of TIME 
+6%  Your message of "TIME" 
+17%  hundreds of other variants (average 0.4% each?) 
+
+
+Of course these numbers are very much dependent on the sample set, which, in this case, was probably skewed toward Unix users, and/or toward people who had been on the net for quite some time (due to the age of the archives I checked.) 
+
+However, this seems to indicate that it's not unreasonable to assume that, if there is an In-Reply-To field, then the first <>-bracketed text found therein is the Message-ID of the parent message. It is safe to assume this, that is, so long as you still exhibit reasonable behavior when that assumption turns out to be wrong, which will happen a small-but-not-insignificant portion of the time. 
+
+RFC 2822, the successor to RFC 822, updated the definition of In-Reply-To: by the more modern standard, In-Reply-To may contain only message IDs. There will usually be only one, but there could be more than one: these are the IDs of the messages to which this one is a direct reply (the idea being that you might be sending one message in reply to several others.) 
+
+
+References: 
+The References header was defined by RFC 822 in 1982. It was defined in, effectively, the same way as the In-Reply-To header was defined: which is to say, its definition was pretty useless. (Like In-Reply-To, its definition was also tightened up in 2001 by RFC 2822.) 
+
+However, the References header was also defined in 1987 by RFC 1036 (section 2.2.5), the standard for USENET news messages. That definition was much tighter and more useful than the RFC 822 definition: it asserts that this header contain a list of Message-IDs listing the parent, grandparent, great-grandparent, and so on, of this message, oldest first. That is, the direct parent of this message will be the last element of the References header. 
+
+It is not guaranteed to contain the entire tree back to the root-most message in the thread: news readers are allowed to truncate it at their discretion, and the manner in which they truncate it (from the front, from the back, or from the middle) is not defined. 
+
+Therefore, while there is useful info in the References header, it is not uncommon for multiple messages in the same thread to have seemingly-contradictory References data, so threading code must make an effort to do the right thing in the face of conflicting data. 
+
+RFC 2822 updated the mail standard to have the same semantics of References as the news standard, RFC 1036. 
+
+In practice, if you ever see a References header in a mail message, it will follow the RFC 1036 (and RFC 2822) definition rather than the RFC 822 definition. Because the References header both contains more information and is easier to parse, many modern mail user agents generate and use the References header in mail instead of (or in addition to) In-Reply-To, and use the USENET semantics when they do so. 
+
+You will generally not see In-Reply-To in a news message, but it can occasionally happen, usually as a result of mail/news gateways. 
+
+So, any sensible threading software will have the ability to take both In-Reply-To and References headers into account. 
+
+Note: RFC 2822 (section 3.6.4) says that a References field should contain the contents of the parent message's References field, followed by the contents of the parent's Message-ID field (in other words, the References field should contain the path through the thread.) However, I've been informed that recent versions of Eudora violate this standard: they put the parent Message-ID in the In-Reply-To header, but do not duplicate it in the References header: instead, the References header contains the grandparent, great-grand-parent, etc. 
+
+This implies that to properly reconstruct the thread of a message in the face of this nonstandard behavior, we need to append any In-Reply-To message IDs to References. 
+
+
+
+--------------------------------------------------------------------------------
+
+
+The Algorithm
+This algorithm consists of five main steps, and each of those steps is somewhat complicated. However, once you've wrapped your brain around it, it's not really that complicated, considering what it does. 
+
+In defense of its complexity, I can say this: 
+
+This algorithm is incredibly robust in the face of garbage input, and even in the face of malicious input (you cannot construct a set of inputs that will send this algorithm into a loop, for example.) 
+
+This algorithm has been field-tested by something on the order of ten million users over the course of six years. 
+
+It really does work incredibly well. I've never seen it produce results that were anything less than totally reasonable. 
+Well, enough with the disclaimers. 
+
+
+
+--------------------------------------------------------------------------------
+
+
+Definitions: 
+
+A Container object is composed of: 
+
+Message message;            // (may be null) 
+Container parent;   
+Container child;  // first child  
+Container next;  // next element in sibling list, or null 
+
+
+A Message object only has a few fields we are interested in: 
+
+String subject;             
+ID message_id;  // the ID of this message  
+ID *references;  // list of IDs of parent messages  
+
+The References field is populated from the ``References'' and/or ``In-Reply-To'' headers. If both headers exist, take the first thing in the In-Reply-To header that looks like a Message-ID, and append it to the References header. 
+
+If there are multiple things in In-Reply-To that look like Message-IDs, only use the first one of them: odds are that the later ones are actually email addresses, not IDs. 
+
+These ID objects can be strings, or they can be any other token on which you can do meaningful equality comparisons. 
+
+Only two things need to be done with the subject strings: ask whether they begin with ``Re:'', and compare the non-Re parts for equivalence. So you can get away with interning or otherwise hashing these, too. (This is a very good idea: my code does this so that I can use == instead of strcmp inside the loop.) 
+
+The ID objects also don't need to be strings, for the same reason. They can be hashes or numeric indexes or anything for which equality comparisons hold, so it's way faster if you can do pointer-equivalence comparisons instead of strcmp. 
+
+The reason the Container and Message objects are separate is because the Container fields are only needed during the act of threading: you don't need to keep those around, so there's no point in bulking up every Message structure with them. 
+
+
+The id_table is a hash table associating Message-IDs with Containers. 
+
+An ``empty container'' is one that doesn't have a message in it, but which shows evidence of having existed. For whatever reason, we don't have that message in our list (maybe it is expired or canceled, maybe it was deleted from the folder, or any of several other reasons.) 
+At presentation-time, these will show up as unselectable ``parent'' containers, for example, if we have the thread 
+
+
+      -- A
+         |-- B
+         \-- C
+      -- D
+
+and we know about messages B and C, but their common parent A does not exist, there will be a placeholder for A, to group them together, and prevent D from seeming to be a sibling of B and C. 
+These ``dummy'' messages only ever occur at depth 0. 
+
+The Algorithm: 
+
+
+For each message: 
+
+If id_table contains an empty Container for this ID: 
+Store this message in the Container's message slot. 
+Else: 
+Create a new Container object holding this message; 
+Index the Container by Message-ID in id_table. 
+
+For each element in the message's References field: 
+
+Find a Container object for the given Message-ID: 
+If there's one in id_table use that; 
+Otherwise, make (and index) one with a null Message. 
+
+Link the References field's Containers together in the order implied by the References header. 
+If they are already linked, don't change the existing links. 
+Do not add a link if adding that link would introduce a loop: that is, before asserting A->B, search down the children of B to see if A is reachable, and also search down the children of A to see if B is reachable. If either is already reachable as a child of the other, don't add the link. 
+
+Set the parent of this message to be the last element in References. Note that this message may have a parent already: this can happen because we saw this ID in a References field, and presumed a parent based on the other entries in that field. Now that we have the actual message, we can be more definitive, so throw away the old parent and use this new one. Find this Container in the parent's children list, and unlink it. 
+Note that this could cause this message to now have no parent, if it has no references field, but some message referred to it as the non-first element of its references. (Which would have been some kind of lie...) 
+
+Note that at all times, the various ``parent'' and ``child'' fields must be kept inter-consistent. 
+
+
+Find the root set. 
+Walk over the elements of id_table, and gather a list of the Container objects that have no parents. 
+
+
+Discard id_table. We don't need it any more. 
+
+Prune empty containers. 
+Recursively walk all containers under the root set. 
+For each container: 
+If it is an empty container with no children, nuke it. 
+Note: Normally such containers won't occur, but they can show up when two messages have References lines that disagree. For example, assuming A and B are messages, and 1, 2, and 3 are references for messages we haven't seen: 
+
+
+A has references: 1, 2, 3
+B has references: 1, 3 
+There is ambiguity as to whether 3 is a child of 1 or of 2. So, depending on the processing order, we might end up with either 
+
+
+      -- 1
+         |-- 2
+             \-- 3
+                 |-- A
+                 \-- B
+or 
+      -- 1
+         |-- 2            <--- non root childless container!
+         \-- 3
+             |-- A
+             \-- B
+
+If the Container has no Message, but does have children, remove this container but promote its children to this level (that is, splice them in to the current child list.) 
+Do not promote the children if doing so would promote them to the root set -- unless there is only one child, in which case, do. 
+
+
+Group root set by subject. 
+If any two members of the root set have the same subject, merge them. This is so that messages which don't have References headers at all still get threaded (to the extent possible, at least.) 
+
+Construct a new hash table, subject_table, which associates subject strings with Container objects. 
+
+For each Container in the root set: 
+
+Find the subject of that sub-tree: 
+If there is a message in the Container, the subject is the subject of that message. 
+If there is no message in the Container, then the Container will have at least one child Container, and that Container will have a message. Use the subject of that message instead. 
+Strip ``Re:'', ``RE:'', ``RE[5]:'', ``Re: Re[4]: Re:'' and so on. 
+If the subject is now "", give up on this Container. 
+Add this Container to the subject_table if: 
+There is no container in the table with this subject, or 
+This one is an empty container and the old one is not: the empty one is more interesting as a root, so put it in the table instead. 
+The container in the table has a ``Re:'' version of this subject, and this container has a non-``Re:'' version of this subject. The non-re version is the more interesting of the two. 
+
+Now the subject_table is populated with one entry for each subject which occurs in the root set. Now iterate over the root set, and gather together the difference. 
+For each Container in the root set: 
+
+
+Find the subject of this Container (as above.) 
+Look up the Container of that subject in the table. 
+If it is null, or if it is this container, continue. 
+
+Otherwise, we want to group together this Container and the one in the table. There are a few possibilities: 
+
+If both are dummies, append one's children to the other, and remove the now-empty container. 
+
+If one container is a empty and the other is not, make the non-empty one be a child of the empty, and a sibling of the other ``real'' messages with the same subject (the empty's children.) 
+
+If that container is a non-empty, and that message's subject does not begin with ``Re:'', but this message's subject does, then make this be a child of the other. 
+
+If that container is a non-empty, and that message's subject begins with ``Re:'', but this message's subject does not, then make that be a child of this one -- they were misordered. (This happens somewhat implicitly, since if there are two messages, one with Re: and one without, the one without will be in the hash table, regardless of the order in which they were seen.) 
+
+Otherwise, make a new empty container and make both msgs be a child of it. This catches the both-are-replies and neither-are-replies cases, and makes them be siblings instead of asserting a hierarchical relationship which might not be true. 
+(People who reply to messages without using ``Re:'' and without using a References line will break this slightly. Those people suck.) 
+
+(It has occurred to me that taking the date or message number into account would be one way of resolving some of the ambiguous cases, but that's not altogether straightforward either.) 
+
+
+Now you're done threading!
+Specifically, you no longer need the ``parent'' slot of the Container object, so if you wanted to flush the data out into a smaller, longer-lived structure, you could reclaim some storage as a result. 
+
+Now, sort the siblings.
+At this point, the parent-child relationships are set. However, the sibling ordering has not been adjusted, so now is the time to walk the tree one last time and order the siblings by date, sender, subject, or whatever. This step could also be merged in to the end of step 4, above, but it's probably clearer to make it be a final pass. If you were careful, you could also sort the messages first and take care in the above algorithm to not perturb the ordering, but that doesn't really save anything. 
+
+
+--------------------------------------------------------------------------------
+
+
+You might be wondering what Netscape Confusicator 4.0 broke. Well, basically they never got threading working right. Aside from crashing, corrupting their databases files, and general bugginess, the fundamental problem had been twofold: 
+
+
+4.0 eliminated the ``dummy thread parent'' step, which is an absolute necessity to get threading right in the case where you don't have every message (e.g., because one has expired, or was never sent to you at all.) The best explanation I was able to get from them for why they did this was, ``it looked ugly and I didn't understand why it was there.'' 
+
+4.0 eliminated the ``group similar unthreaded subjects'' step, which is necessary to get some semblance of threading right in the absence of References and In-Reply-To, or in the presence of mangled References. If there was no References header, 4.0 just didn't thread at all. 
+Plus my pet peeve, 
+
+
+The 4.0 UI presented threading as a kind of sorting, which is just not the case. Threading is the act of presenting parent/child relationships, whereas sorting is the act of ordering siblings. 
+That is, 4.0 gives you these choices: ``Sort by Date; Sort by Subject; Sort by message number; or Thread.'' Where they assume that ``Thread'' implies ``Sort by Date.'' So that means that there's no way to see a threaded set of messages that are sorted by message number, or by sender, etc. 
+
+There should be options for how to sort the messages; and then, orthogonal to that should be the boolean option of whether the messages should be threaded. 
+
+I seem to recall there being some other problem that was a result of the thread hierarchy being stored in the database, instead of computed as needed in realtime (there were was some kind of ordering or stale-data issue that came up?) but maybe they finally managed to fix that. 
+
+My C version of this code was able to thread 10,000 messages in less than half a second on a low-end (90 MHz) Pentium, so the argument that it has to be in the database for efficiency is pure bunk. 
+
+Also bunk is the idea that databases are needed for ``scalability.'' This code can thread 100,000 messages without a horrible delay, and the fact is, if you're looking at a 100,000 message folder (or for that matter, if you're running Confusicator at all), you're doing so on a machine that has sufficient memory to hold these structures in core. Also consider the question of whether your GUI toolkit contains a list/outliner widget that can display a million elements in the first place. (The answer is probably ``no.'') Also consider whether you have ever in your life seen a single folder that has a million messages in it, and that further, you've wanted to look at all at once (rather than only looking at the most recent 100,000 messages to arrive in that newsgroup...) 
+
+In short, all the arguments I've heard for using databases to implement threading and mbox summarization are solving problems that simply don't exist. Show me a real-world situation where the above technique actually falls down, and then we'll talk. 
+
+Just say no to databases! 
+
+  /* -*- Mode: java; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+    *
+    * The contents of this file are subject to the Mozilla Public
+    * License Version 1.1 (the "License"); you may not use this file
+    * except in compliance with the License. You may obtain a copy of
+    * the License at http://www.mozilla.org/MPL/
+    *
+    * Software distributed under the License is distributed on an "AS
+    * IS" basis, WITHOUT WARRANTY OF ANY KIND, either express or
+    * implied. See the License for the specific language governing
+    * rights and limitations under the License.
+    *
+    * The Original Code is the Grendel mail/news client.
+    *
+    * The Initial Developer of the Original Code is Netscape Communications
+    * Corporation.  Portions created by Netscape are
+    * Copyright (C) 1997 Netscape Communications Corporation. All
+    * Rights Reserved.
+    *
+    * Contributor(s): 
+    *
+    * Created: Jamie Zawinski <jwz@netscape.com>, 13 Jun 1995.
+    * Ported from C on 14 Aug 1997.
+    */
+   
+   package grendel.view;
+   
+   import java.util.Hashtable;
+   import java.util.Enumeration;
+   
+   import calypso.util.Assert;
+   
+   /**
+      This arranges a set of messages into a thread hierarchy, by references.
+      The sets of messages are accessed via the IThreadable interface.
+   
+      @see IThreadable
+      @see Sorter
+    */
+   
+   class Threader {
+     private ThreadContainer root_node;     // has kids, and no next
+     private Hashtable id_table;        // maps message IDs to ThreadContainers
+     private int bogus_id_count = 0;    // tick of how many dup IDs we've seen
+   
+     /** Threads the set of messages indicated by threadable_root.
+         The IThreadable returned is the new first element of the root set.
+         @param    threadable_root     The start of the list.
+       */
+     public IThreadable thread(IThreadable threadable_root) {
+       if (threadable_root == null) return null;
+       id_table = new Hashtable();
+   
+       for (Enumeration e = threadable_root.allElements(); e.hasMoreElements();) {
+         IThreadable t = (IThreadable) e.nextElement();
+         if (!t.isDummy())
+           buildContainer(t);
+       }
+   
+       root_node = findRootSet();
+       id_table.clear();
+       id_table = null;
+   
+       pruneEmptyContainers(root_node);
+   
+       // We do this so to avoid flipping the input order each time through.
+       root_node.reverseChildren();
+   
+       gatherSubjects();
+   
+       if (root_node.next != null)
+         throw new Error("root node has a next?" + root_node);
+   
+       for (ThreadContainer r = root_node.child; r != null; r = r.next) {
+         // If this direct child of the root node has no threadable in it,
+         // manufacture a dummy container to bind its children together.
+         // Note that these dummies can only ever occur as elements of
+         // the root set.
+         if (r.threadable == null)
+           r.threadable = r.child.threadable.makeDummy();
+       }
+   
+       IThreadable result = (root_node.child == null
+                             ? null
+                             : root_node.child.threadable);
+   
+       // Flush the tree structure of each element of the root set down into
+       // their underlying threadables.
+       root_node.flush();
+       root_node = null;
+       return result;
+     }
+   
+   
+     // buildContainer() does three things:
+     //
+     //   = It walks the tree of threadables, and wraps each in a
+     //     ThreadContainer object.
+     //   = It indexes each ThreadContainer object in the id_table, under
+     //     the message ID of the contained IThreadable.
+     //   = For each of the IThreadable's references, it ensures that there
+     //     is a ThreadContainer in the table (an empty one, if necessary.)
+     //
+     private void buildContainer(IThreadable threadable) {
+   
+       Object id = threadable.messageThreadID();
+       Assert.Assertion(id != null);
+       ThreadContainer c = (ThreadContainer) id_table.get (id);
+   
+       if (c != null) {
+         // There is already a ThreadContainer in the table for this ID.
+         // Under normal circumstances, there will be no IThreadable in it
+         // (since it was a forward reference from a References field.)
+         //
+         // If there is already a threadable in it, then that means there
+         // are two IThreadables with the same ID.  Generate a new ID for
+         // this one, sigh...  This ID is only used to cause the two entries
+         // in the hash table to not stomp each other.
+         //
+         if (c.threadable != null) {
+           id = "<Bogus-id:" + (bogus_id_count++) + ">";
+           c = null;
+         } else {
+           c.threadable = threadable;
+         }
+       }
+   
+       // Create a ThreadContainer for this IThreadable, and index it in
+       // the hash table.
+       //
+       if (c == null) {
+         c = new ThreadContainer();
+         c.threadable = threadable;
+   //      c.debug_id = id;
+         id_table.put (id, c);
+       }
+   
+       // Create ThreadContainers for each of the references which don't
+       // have them.  Link each of the referenced messages together in the
+       // order implied by the references field, unless they are already
+       // linked.
+       ThreadContainer parent_ref = null;
+       {
+         Object refs[] = threadable.messageThreadReferences();
+         int L = (refs == null ? 0 : refs.length);
+         for (int i = 0; i < L; i++) {
+           Object ref_string = refs[i];
+           ThreadContainer ref = (ThreadContainer) id_table.get (ref_string);
+   
+           if (ref == null) {
+             ref = new ThreadContainer();
+   //          ref.debug_id = ref_string;
+             id_table.put (ref_string, ref);
+           }
+   
+           // If we have references A B C D, make D be a child of C, etc,
+           // except if they have parents already.
+           //
+           if (parent_ref != null &&               // there is a parent
+               ref.parent == null &&               // don't have a parent already
+               parent_ref != ref &&                // not a tight loop
+               !parent_ref.find_child(ref)) {      // not a wide loop
+             // Ok, link it into the parent's child list.
+             ref.parent = parent_ref;
+             ref.next = parent_ref.child;
+             parent_ref.child = ref;
+           }
+           parent_ref = ref;
+         }
+       }
+   
+       // At this point `parent_ref' is set to the container of the last element
+       // in the references field.  Make that be the parent of this container,
+       // unless doing so would introduce a circularity.
+       //
+       if (parent_ref != null &&
+           (parent_ref == c ||
+            c.find_child (parent_ref)))
+         parent_ref = null;
+   
+       if (c.parent != null) {
+         // If it has a parent already, that's there because we saw this message
+         // in a references field, and presumed a parent based on the other
+         // entries in that field.  Now that we have the actual message, we can
+         // be more definitive, so throw away the old parent and use this new one.
+         // Find this container in the parent's child-list, and unlink it.
+         //
+         // Note that this could cause this message to now have no parent, if it
+         // has no references field, but some message referred to it as the
+         // non-first element of its references.  (Which would have been some
+         // kind of lie...)
+         //
+         ThreadContainer rest, prev;
+         for (prev = null, rest = c.parent.child;
+              rest != null;
+              prev = rest, rest = rest.next) {
+           if (rest == c)
+             break;
+         }
+         if (rest == null)
+           throw new Error("didn't find " + c + " in parent " + c.parent);
+   
+         if (prev == null)
+           c.parent.child = c.next;
+         else
+           prev.next = c.next;
+   
+         c.next = null;
+         c.parent = null;
+       }
+   
+       // If we have a parent, link c into the parent's child list.
+       if (parent_ref != null) {
+         c.parent = parent_ref;
+         c.next = parent_ref.child;
+         parent_ref.child = c;
+       }
+     }
+   
+   
+     // Find the root set of the ThreadContainers (and return a root node.)
+     // A container is in the root set if it has no parents.
+     //
+     private ThreadContainer findRootSet() {
+       ThreadContainer root = new ThreadContainer();
+   //    root.debug_id = "((root))";
+       for (Enumeration e = id_table.elements(); e.hasMoreElements(); ) {
+         ThreadContainer c = (ThreadContainer) e.nextElement();
+         if (c.parent == null) {
+           if (c.next != null)
+             throw new Error("c.next is " + c.next.toString());
+           c.next = root.child;
+           root.child = c;
+         }
+       }
+       return root;
+     }
+   
+   
+     // Walk through the threads and discard any empty container objects.
+     // After calling this, there will only be any empty container objects
+     // at depth 0, and those will all have at least two kids.
+     //
+     private void pruneEmptyContainers(ThreadContainer parent) {
+       ThreadContainer container, prev, next;
+       for (prev = null, container = parent.child, next = container.next;
+            container != null;
+            prev = container, container = next,
+              next = (container == null ? null : container.next)) {
+   
+         if (container.threadable == null &&
+             container.child == null) {
+           // This is an empty container with no kids.  Nuke it.
+           //
+           // Normally such containers won't occur, but they can show up when
+           // two messages have References lines that disagree.  For example,
+           // assuming A and B are messages, and 1, 2, and 3 are references for
+           // messages we haven't seen:
+           //
+           //        A has refs: 1 2 3
+           //        B has refs: 1 3
+           //
+           // There is ambiguity as to whether 3 is a child of 1 or 2.  So,
+           // depending on the processing order, we might end up with either
+           //
+           //        -- 1
+           //           |-- 2
+           //               |-- 3
+           //                   |-- A
+           //                   |-- B
+           // or
+           //        -- 1
+           //           |-- 2            <--- non root childless container
+           //           |-- 3
+           //               |-- A
+           //               |-- B
+           //
+           if (prev == null)
+             parent.child = container.next;
+           else
+             prev.next = container.next;
+   
+           // Set container to prev so that prev keeps its same value
+           // the next time through the loop.
+           container = prev;
+   
+         } else if (container.threadable == null &&    // expired, and
+                    container.child != null &&         // has kids, and
+                    (container.parent != null ||       //   not at root, or
+                     container.child.next == null)) {  //   only one kid
+   
+           // Expired message with kids.  Promote the kids to this level.
+           // Don't do this if we would be promoting them to the root level,
+           // unless there is only one kid.
+   
+           ThreadContainer tail;
+           ThreadContainer kids = container.child;
+   
+           // Remove this container from the list, replacing it with `kids'.
+           if (prev == null)
+             parent.child = kids;
+           else
+             prev.next = kids;
+   
+           // make each child's parent be this level's parent.
+           // make the last child's next be this container's next
+           // (splicing `kids' into the list in place of `container'.)
+           for (tail = kids; tail.next != null; tail = tail.next)
+             tail.parent = container.parent;
+   
+           tail.parent = container.parent;
+           tail.next = container.next;
+   
+           // Since we've inserted items in the chain, `next' currently points
+           // to the item after them (tail.next); reset that so that we process
+           // the newly promoted items the very next time around.
+           next = kids;
+   
+           // Set container to prev so that prev keeps its same value
+           // the next time through the loop.
+           container = prev;
+   
+         } else if (container.child != null) {
+           // A real message with kids.
+           // Iterate over its children, and try to strip out the junk.
+   
+           pruneEmptyContainers(container);
+         }
+       }
+     }
+   
+   
+     // If any two members of the root set have the same subject, merge them.
+     // This is so that messages which don't have References headers at all
+     // still get threaded (to the extent possible, at least.)
+     //
+     private void gatherSubjects() {
+   
+       int count = 0;
+       for (ThreadContainer c = root_node.child; c != null; c = c.next)
+         count++;
+   
+       // Make the hash table large enough to not need to be rehashed.
+       Hashtable subj_table = new Hashtable((int) (count * 1.2), (float) 0.9);
+   
+       count = 0;
+       for (ThreadContainer c = root_node.child; c != null; c = c.next) {
+         IThreadable threadable = c.threadable;
+   
+         // If there is no threadable, this is a dummy node in the root set.
+         // Only root set members may be dummies, and they always have at least
+         // two kids.  Take the first kid as representative of the subject.
+         if (threadable == null)
+           threadable = c.child.threadable;
+   
+         String subj = threadable.simplifiedSubject();
+   
+         if (subj == null || subj == "")
+           continue;
+   
+         ThreadContainer old = (ThreadContainer) subj_table.get(subj);
+   
+         // Add this container to the table if:
+         //  - There is no container in the table with this subject, or
+         //  - This one is a dummy container and the old one is not: the dummy
+         //    one is more interesting as a root, so put it in the table instead.
+         //  - The container in the table has a "Re:" version of this subject,
+         //    and this container has a non-"Re:" version of this subject.
+         //    The non-re version is the more interesting of the two.
+         //
+         if (old == null ||
+             (c.threadable == null && old.threadable != null) ||
+             (old.threadable != null && old.threadable.subjectIsReply() &&
+              c.threadable   != null &&  !c.threadable.subjectIsReply())) {
+           subj_table.put(subj, c);
+           count++;
+         }
+       }
+   
+       if (count == 0)   // if the table is empty, we're done.
+         return;
+   
+       // The subj_table is now populated with one entry for each subject which
+       // occurs in the root set.  Now iterate over the root set, and gather
+       // together the difference.
+       //
+       ThreadContainer prev, c, rest;
+       for (prev = null, c = root_node.child, rest = c.next;
+            c != null;
+            prev = c, c = rest, rest = (rest == null ? null : rest.next)) {
+   
+         IThreadable threadable = c.threadable;
+         if (threadable == null)  // might be a dummy -- see above
+           threadable = c.child.threadable;
+   
+         String subj = threadable.simplifiedSubject();
+   
+         // Don't thread together all subjectless messages; let them dangle.
+         if (subj == null || subj == "")
+           continue;
+   
+         ThreadContainer old = (ThreadContainer) subj_table.get(subj);
+         if (old == c)     // oops, that's us
+           continue;
+   
+         // Ok, so now we have found another container in the root set with
+         // the same subject.  There are a few possibilities:
+         //
+         // - If both are dummies, append one's children to the other, and remove
+         //   the now-empty container.
+         //
+         // - If one container is a dummy and the other is not, make the non-dummy
+         //   one be a child of the dummy, and a sibling of the other "real"
+         //   messages with the same subject (the dummy's children.)
+         //
+         // - If that container is a non-dummy, and that message's subject does
+         //   not begin with "Re:", but *this* message's subject does, then
+         //   make this be a child of the other.
+         //
+         // - If that container is a non-dummy, and that message's subject begins
+         //   with "Re:", but *this* message's subject does *not*, then make that
+         //   be a child of this one -- they were misordered.  (This happens
+         //   somewhat implicitly, since if there are two messages, one with Re:
+         //   and one without, the one without will be in the hash table,
+         //   regardless of the order in which they were seen.)
+         //
+         // - Otherwise, make a new dummy container and make both messages be a
+         //   child of it.  This catches the both-are-replies and neither-are-
+         //   replies cases, and makes them be siblings instead of asserting a
+         //   hierarchical relationship which might not be true.
+         //
+         //   (People who reply to messages without using "Re:" and without using
+         //   a References line will break this slightly.  Those people suck.)
+         //
+         // (It has occurred to me that taking the date or message number into
+         // account would be one way of resolving some of the ambiguous cases,
+         // but that's not altogether straightforward either.)
+   
+   
+         // Remove the "second" message from the root set.
+         if (prev == null)
+           root_node.child = c.next;
+         else
+           prev.next = c.next;
+         c.next = null;
+   
+   
+         if (old.threadable == null && c.threadable == null) {
+           // They're both dummies; merge them.
+           ThreadContainer tail;
+           for (tail = old.child;
+                tail != null && tail.next != null;
+                tail = tail.next)
+             ;
+           tail.next = c.child;
+           for (tail = c.child; tail != null; tail = tail.next)
+             tail.parent = old;
+           c.child = null;
+   
+         } else if (old.threadable == null ||               // old is empty, or
+                    (c.threadable != null &&
+                     c.threadable.subjectIsReply() &&       //   c has Re, and
+                     !old.threadable.subjectIsReply())) {   //   old does not.
+           // Make this message be a child of the other.
+           c.parent = old;
+           c.next = old.child;
+           old.child = c;
+   
+         } else {
+           // Make the old and new messages be children of a new dummy container.
+           // We do this by creating a new container object for old->msg and
+           // transforming the old container into a dummy (by merely emptying it),
+           // so that the hash table still points to the one that is at depth 0
+           // instead of depth 1.
+   
+           ThreadContainer newc = new ThreadContainer();
+           newc.threadable = old.threadable;
+   //        newc.debug_id = old.debug_id;
+           newc.child = old.child;
+           for (ThreadContainer tail = newc.child; tail != null; tail = tail.next)
+             tail.parent = newc;
+   
+           old.threadable = null;
+           old.child = null;
+   //        old.debug_id = null;
+   
+           c.parent = old;
+           newc.parent = old;
+   
+           // old is now a dummy; make it have exactly two kids, c and newc.
+           old.child = c;
+           c.next = newc;
+         }
+   
+         // we've done a merge, so keep the same `prev' next time around.
+         c = prev;
+       }
+   
+       subj_table.clear();
+       subj_table = null;
+     }
+   }
+   
+   
+   /*
+      The ThreadContainer object is used to encapsulate an IThreadable object
+      (it holds some intermediate state used while threading.)  This is a
+      private class that doesn't escape from this module.
+    */
+   
+   class ThreadContainer {
+     IThreadable threadable;
+     ThreadContainer parent;
+     ThreadContainer child;
+     ThreadContainer next;
+   
+   //  Object debug_id;
+   //  int id2;
+   //  static int id2_pool = 0;
+   
+   //  ThreadContainer() { id2 = ++id2_pool; }
+   
+   //  public String toString() { return "<cont " +
+   //                               id2 + " " + debug_id +
+   //                               " [" + threadable + "] >"; }
+   
+   //  public void debug_print(int depth) {
+   //    for (int i = 0; i < depth; i++) System.out.print("  ");
+   //    System.out.println(this);
+   //    if (child != null) child.debug_print(depth+1);
+   //    if (next != null) next.debug_print(depth);
+   //  }
+   
+     // Copy the ThreadContainer tree structure down into the underlying
+     // IThreadable objects (that is, make the IThreadable tree look like
+     // the ThreadContainer tree.)
+     //
+     void flush() {
+       if (parent != null && threadable == null)
+         // Only the root_node is allowed to not have a threadable.
+         throw new Error("no threadable in " + this.toString());
+   
+       parent = null;
+   
+       if (threadable != null)
+         threadable.setChild(child == null ? null : child.threadable);
+   
+       if (child != null) {
+         child.flush();
+         child = null;
+       }
+   
+       if (threadable != null)
+         threadable.setNext(next == null ? null : next.threadable);
+   
+       if (next != null) {
+         next.flush();
+         next = null;
+       }
+   
+       threadable = null;
+     }
+   
+     // Returns true if child is under self's tree.  This is used for
+     // detecting circularities in the references header.
+     boolean find_child(ThreadContainer target) {
+       if (child == null)
+         return false;
+       else if (child == target)
+         return true;
+       else
+         return child.find_child(target);
+     }
+   
+     void reverseChildren() {
+       if (child != null) {
+         // nreverse the children (child through child.next.next.next...)
+         ThreadContainer kid, prev, rest;
+         for (prev = null, kid = child, rest = kid.next;
+              kid != null;
+              prev = kid, kid = rest, rest = (rest == null ? null : rest.next))
+           kid.next = prev;
+         child = prev;
+   
+         // then do it for the kids
+         for (kid = child; kid != null; kid = kid.next)
+           kid.reverseChildren();
+       }
+     }
+   }
+   
+
+/* -*- Mode: java; indent-tabs-mode: nil; c-basic-offset: 2 -*-
+*
+* The contents of this file are subject to the Mozilla Public
+* License Version 1.1 (the "License"); you may not use this file
+* except in compliance with the License. You may obtain a copy of
+* the License at http://www.mozilla.org/MPL/
+*
+* Software distributed under the License is distributed on an "AS
+* IS" basis, WITHOUT WARRANTY OF ANY KIND, either express or
+* implied. See the License for the specific language governing
+* rights and limitations under the License.
+*
+* The Original Code is the Grendel mail/news client.
+*
+* The Initial Developer of the Original Code is Netscape Communications
+* Corporation.  Portions created by Netscape are
+* Copyright (C) 1997 Netscape Communications Corporation. All
+* Rights Reserved.
+*
+* Contributor(s): 
+*
+* Created: Jamie Zawinski <jwz@netscape.com>, 13 Jun 1995.
+* Ported from C on 14 Aug 1997.
+*/
+
+package grendel.view;
+
+import java.util.Hashtable;
+import java.util.Enumeration;
+
+import calypso.util.Assert;
+
+/**
+   This arranges a set of messages into a thread hierarchy, by references.
+   The sets of messages are accessed via the IThreadable interface.
+
+   @see IThreadable
+   @see Sorter
+*/
+
+class Threader {
+  private ThreadContainer root_node;     // has kids, and no next
+  private Hashtable id_table;        // maps message IDs to ThreadContainers
+  private int bogus_id_count = 0;    // tick of how many dup IDs we've seen
+
+  /** Threads the set of messages indicated by threadable_root.
+      The IThreadable returned is the new first element of the root set.
+      @param    threadable_root     The start of the list.
+  */
+  public IThreadable thread(IThreadable threadable_root) {
+    if (threadable_root == null) return null;
+    id_table = new Hashtable();
+
+    for (Enumeration e = threadable_root.allElements(); e.hasMoreElements();) {
+      IThreadable t = (IThreadable) e.nextElement();
+      if (!t.isDummy())
+        buildContainer(t);
+    }
+
+    root_node = findRootSet();
+    id_table.clear();
+    id_table = null;
+
+    pruneEmptyContainers(root_node);
+
+    // We do this so to avoid flipping the input order each time through.
+    root_node.reverseChildren();
+
+    gatherSubjects();
+
+    if (root_node.next != null)
+      throw new Error("root node has a next?" + root_node);
+
+    for (ThreadContainer r = root_node.child; r != null; r = r.next) {
+      // If this direct child of the root node has no threadable in it,
+      // manufacture a dummy container to bind its children together.
+      // Note that these dummies can only ever occur as elements of
+      // the root set.
+      if (r.threadable == null)
+        r.threadable = r.child.threadable.makeDummy();
+    }
+
+    IThreadable result = (root_node.child == null
+                          ? null
+                          : root_node.child.threadable);
+
+    // Flush the tree structure of each element of the root set down into
+    // their underlying threadables.
+    root_node.flush();
+    root_node = null;
+    return result;
+  }
+
+
+  // buildContainer() does three things:
+  //
+  //   = It walks the tree of threadables, and wraps each in a
+  //     ThreadContainer object.
+  //   = It indexes each ThreadContainer object in the id_table, under
+  //     the message ID of the contained IThreadable.
+  //   = For each of the IThreadable's references, it ensures that there
+  //     is a ThreadContainer in the table (an empty one, if necessary.)
+  //
+  private void buildContainer(IThreadable threadable) {
+
+    Object id = threadable.messageThreadID();
+    Assert.Assertion(id != null);
+    ThreadContainer c = (ThreadContainer) id_table.get (id);
+
+    if (c != null) {
+      // There is already a ThreadContainer in the table for this ID.
+      // Under normal circumstances, there will be no IThreadable in it
+      // (since it was a forward reference from a References field.)
+      //
+      // If there is already a threadable in it, then that means there
+      // are two IThreadables with the same ID.  Generate a new ID for
+      // this one, sigh...  This ID is only used to cause the two entries
+      // in the hash table to not stomp each other.
+      //
+      if (c.threadable != null) {
+        id = "<Bogus-id:" + (bogus_id_count++) + ">";
+        c = null;
+      } else {
+        c.threadable = threadable;
+      }
+    }
+
+    // Create a ThreadContainer for this IThreadable, and index it in
+    // the hash table.
+    //
+    if (c == null) {
+      c = new ThreadContainer();
+      c.threadable = threadable;
+      //      c.debug_id = id;
+      id_table.put (id, c);
+    }
+
+    // Create ThreadContainers for each of the references which don't
+    // have them.  Link each of the referenced messages together in the
+    // order implied by the references field, unless they are already
+    // linked.
+    ThreadContainer parent_ref = null;
+    {
+      Object refs[] = threadable.messageThreadReferences();
+      int L = (refs == null ? 0 : refs.length);
+      for (int i = 0; i < L; i++) {
+        Object ref_string = refs[i];
+        ThreadContainer ref = (ThreadContainer) id_table.get (ref_string);
+
+        if (ref == null) {
+          ref = new ThreadContainer();
+          //          ref.debug_id = ref_string;
+          id_table.put (ref_string, ref);
+        }
+
+        // If we have references A B C D, make D be a child of C, etc,
+        // except if they have parents already.
+        //
+        if (parent_ref != null &&               // there is a parent
+            ref.parent == null &&               // don't have a parent already
+            parent_ref != ref &&                // not a tight loop
+            !parent_ref.find_child(ref)) {      // not a wide loop
+          // Ok, link it into the parent's child list.
+          ref.parent = parent_ref;
+          ref.next = parent_ref.child;
+          parent_ref.child = ref;
+        }
+        parent_ref = ref;
+      }
+    }
+
+    // At this point `parent_ref' is set to the container of the last element
+    // in the references field.  Make that be the parent of this container,
+    // unless doing so would introduce a circularity.
+    //
+    if (parent_ref != null &&
+        (parent_ref == c ||
+         c.find_child (parent_ref)))
+      parent_ref = null;
+
+    if (c.parent != null) {
+      // If it has a parent already, that's there because we saw this message
+      // in a references field, and presumed a parent based on the other
+      // entries in that field.  Now that we have the actual message, we can
+      // be more definitive, so throw away the old parent and use this new one.
+      // Find this container in the parent's child-list, and unlink it.
+      //
+      // Note that this could cause this message to now have no parent, if it
+      // has no references field, but some message referred to it as the
+      // non-first element of its references.  (Which would have been some
+      // kind of lie...)
+      //
+      ThreadContainer rest, prev;
+      for (prev = null, rest = c.parent.child;
+           rest != null;
+           prev = rest, rest = rest.next) {
+        if (rest == c)
+          break;
+      }
+      if (rest == null)
+        throw new Error("didn't find " + c + " in parent " + c.parent);
+
+      if (prev == null)
+        c.parent.child = c.next;
+      else
+        prev.next = c.next;
+
+      c.next = null;
+      c.parent = null;
+    }
+
+    // If we have a parent, link c into the parent's child list.
+    if (parent_ref != null) {
+      c.parent = parent_ref;
+      c.next = parent_ref.child;
+      parent_ref.child = c;
+    }
+  }
+
+
+  // Find the root set of the ThreadContainers (and return a root node.)
+  // A container is in the root set if it has no parents.
+  //
+  private ThreadContainer findRootSet() {
+    ThreadContainer root = new ThreadContainer();
+    //    root.debug_id = "((root))";
+    for (Enumeration e = id_table.elements(); e.hasMoreElements(); ) {
+      ThreadContainer c = (ThreadContainer) e.nextElement();
+      if (c.parent == null) {
+        if (c.next != null)
+          throw new Error("c.next is " + c.next.toString());
+        c.next = root.child;
+        root.child = c;
+      }
+    }
+    return root;
+  }
+
+
+  // Walk through the threads and discard any empty container objects.
+  // After calling this, there will only be any empty container objects
+  // at depth 0, and those will all have at least two kids.
+  //
+  private void pruneEmptyContainers(ThreadContainer parent) {
+    ThreadContainer container, prev, next;
+    for (prev = null, container = parent.child, next = container.next;
+         container != null;
+         prev = container, container = next,
+           next = (container == null ? null : container.next)) {
+
+      if (container.threadable == null &&
+          container.child == null) {
+        // This is an empty container with no kids.  Nuke it.
+        //
+        // Normally such containers won't occur, but they can show up when
+        // two messages have References lines that disagree.  For example,
+        // assuming A and B are messages, and 1, 2, and 3 are references for
+        // messages we haven't seen:
+        //
+        //        A has refs: 1 2 3
+        //        B has refs: 1 3
+        //
+        // There is ambiguity as to whether 3 is a child of 1 or 2.  So,
+        // depending on the processing order, we might end up with either
+        //
+        //        -- 1
+        //           |-- 2
+        //               |-- 3
+        //                   |-- A
+        //                   |-- B
+        // or
+        //        -- 1
+        //           |-- 2            <--- non root childless container
+        //           |-- 3
+        //               |-- A
+        //               |-- B
+        //
+        if (prev == null)
+          parent.child = container.next;
+        else
+          prev.next = container.next;
+
+        // Set container to prev so that prev keeps its same value
+        // the next time through the loop.
+        container = prev;
+
+      } else if (container.threadable == null &&    // expired, and
+                 container.child != null &&         // has kids, and
+                 (container.parent != null ||       //   not at root, or
+                  container.child.next == null)) {  //   only one kid
+
+        // Expired message with kids.  Promote the kids to this level.
+        // Don't do this if we would be promoting them to the root level,
+        // unless there is only one kid.
+
+        ThreadContainer tail;
+        ThreadContainer kids = container.child;
+
+        // Remove this container from the list, replacing it with `kids'.
+        if (prev == null)
+          parent.child = kids;
+        else
+          prev.next = kids;
+
+        // make each child's parent be this level's parent.
+        // make the last child's next be this container's next
+        // (splicing `kids' into the list in place of `container'.)
+        for (tail = kids; tail.next != null; tail = tail.next)
+          tail.parent = container.parent;
+
+        tail.parent = container.parent;
+        tail.next = container.next;
+
+        // Since we've inserted items in the chain, `next' currently points
+        // to the item after them (tail.next); reset that so that we process
+        // the newly promoted items the very next time around.
+        next = kids;
+
+        // Set container to prev so that prev keeps its same value
+        // the next time through the loop.
+        container = prev;
+
+      } else if (container.child != null) {
+        // A real message with kids.
+        // Iterate over its children, and try to strip out the junk.
+
+        pruneEmptyContainers(container);
+      }
+    }
+  }
+
+
+  // If any two members of the root set have the same subject, merge them.
+  // This is so that messages which don't have References headers at all
+  // still get threaded (to the extent possible, at least.)
+  //
+  private void gatherSubjects() {
+
+    int count = 0;
+    for (ThreadContainer c = root_node.child; c != null; c = c.next)
+      count++;
+
+    // Make the hash table large enough to not need to be rehashed.
+    Hashtable subj_table = new Hashtable((int) (count * 1.2), (float) 0.9);
+
+    count = 0;
+    for (ThreadContainer c = root_node.child; c != null; c = c.next) {
+      IThreadable threadable = c.threadable;
+
+      // If there is no threadable, this is a dummy node in the root set.
+      // Only root set members may be dummies, and they always have at least
+      // two kids.  Take the first kid as representative of the subject.
+      if (threadable == null)
+        threadable = c.child.threadable;
+
+      String subj = threadable.simplifiedSubject();
+
+      if (subj == null || subj == "")
+        continue;
+
+      ThreadContainer old = (ThreadContainer) subj_table.get(subj);
+
+      // Add this container to the table if:
+      //  - There is no container in the table with this subject, or
+      //  - This one is a dummy container and the old one is not: the dummy
+      //    one is more interesting as a root, so put it in the table instead.
+      //  - The container in the table has a "Re:" version of this subject,
+      //    and this container has a non-"Re:" version of this subject.
+      //    The non-re version is the more interesting of the two.
+      //
+      if (old == null ||
+          (c.threadable == null && old.threadable != null) ||
+          (old.threadable != null && old.threadable.subjectIsReply() &&
+           c.threadable   != null &&  !c.threadable.subjectIsReply())) {
+        subj_table.put(subj, c);
+        count++;
+      }
+    }
+
+    if (count == 0)   // if the table is empty, we're done.
+      return;
+
+    // The subj_table is now populated with one entry for each subject which
+    // occurs in the root set.  Now iterate over the root set, and gather
+    // together the difference.
+    //
+    ThreadContainer prev, c, rest;
+    for (prev = null, c = root_node.child, rest = c.next;
+         c != null;
+         prev = c, c = rest, rest = (rest == null ? null : rest.next)) {
+
+      IThreadable threadable = c.threadable;
+      if (threadable == null)  // might be a dummy -- see above
+        threadable = c.child.threadable;
+
+      String subj = threadable.simplifiedSubject();
+
+      // Don't thread together all subjectless messages; let them dangle.
+      if (subj == null || subj == "")
+        continue;
+
+      ThreadContainer old = (ThreadContainer) subj_table.get(subj);
+      if (old == c)     // oops, that's us
+        continue;
+
+      // Ok, so now we have found another container in the root set with
+      // the same subject.  There are a few possibilities:
+      //
+      // - If both are dummies, append one's children to the other, and remove
+      //   the now-empty container.
+      //
+      // - If one container is a dummy and the other is not, make the non-dummy
+      //   one be a child of the dummy, and a sibling of the other "real"
+      //   messages with the same subject (the dummy's children.)
+      //
+      // - If that container is a non-dummy, and that message's subject does
+      //   not begin with "Re:", but *this* message's subject does, then
+      //   make this be a child of the other.
+      //
+      // - If that container is a non-dummy, and that message's subject begins
+      //   with "Re:", but *this* message's subject does *not*, then make that
+      //   be a child of this one -- they were misordered.  (This happens
+      //   somewhat implicitly, since if there are two messages, one with Re:
+      //   and one without, the one without will be in the hash table,
+      //   regardless of the order in which they were seen.)
+      //
+      // - Otherwise, make a new dummy container and make both messages be a
+      //   child of it.  This catches the both-are-replies and neither-are-
+      //   replies cases, and makes them be siblings instead of asserting a
+      //   hierarchical relationship which might not be true.
+      //
+      //   (People who reply to messages without using "Re:" and without using
+      //   a References line will break this slightly.  Those people suck.)
+      //
+      // (It has occurred to me that taking the date or message number into
+      // account would be one way of resolving some of the ambiguous cases,
+      // but that's not altogether straightforward either.)
+
+
+      // Remove the "second" message from the root set.
+      if (prev == null)
+        root_node.child = c.next;
+      else
+        prev.next = c.next;
+      c.next = null;
+
+
+      if (old.threadable == null && c.threadable == null) {
+        // They're both dummies; merge them.
+        ThreadContainer tail;
+        for (tail = old.child;
+             tail != null && tail.next != null;
+             tail = tail.next)
+          ;
+        tail.next = c.child;
+        for (tail = c.child; tail != null; tail = tail.next)
+          tail.parent = old;
+        c.child = null;
+
+      } else if (old.threadable == null ||               // old is empty, or
+                 (c.threadable != null &&
+                  c.threadable.subjectIsReply() &&       //   c has Re, and
+                  !old.threadable.subjectIsReply())) {   //   old does not.
+        // Make this message be a child of the other.
+        c.parent = old;
+        c.next = old.child;
+        old.child = c;
+
+      } else {
+        // Make the old and new messages be children of a new dummy container.
+        // We do this by creating a new container object for old->msg and
+        // transforming the old container into a dummy (by merely emptying it),
+        // so that the hash table still points to the one that is at depth 0
+        // instead of depth 1.
+
+        ThreadContainer newc = new ThreadContainer();
+        newc.threadable = old.threadable;
+        //        newc.debug_id = old.debug_id;
+        newc.child = old.child;
+        for (ThreadContainer tail = newc.child; tail != null; tail = tail.next)
+          tail.parent = newc;
+
+        old.threadable = null;
+        old.child = null;
+        //        old.debug_id = null;
+
+        c.parent = old;
+        newc.parent = old;
+
+        // old is now a dummy; make it have exactly two kids, c and newc.
+        old.child = c;
+        c.next = newc;
+      }
+
+      // we've done a merge, so keep the same `prev' next time around.
+      c = prev;
+    }
+
+    subj_table.clear();
+    subj_table = null;
+  }
+}
+
+
+/*
+  The ThreadContainer object is used to encapsulate an IThreadable object
+  (it holds some intermediate state used while threading.)  This is a
+  private class that doesn't escape from this module.
+*/
+
+class ThreadContainer {
+  IThreadable threadable;
+  ThreadContainer parent;
+  ThreadContainer child;
+  ThreadContainer next;
+
+  //  Object debug_id;
+  //  int id2;
+  //  static int id2_pool = 0;
+
+  //  ThreadContainer() { id2 = ++id2_pool; }
+
+  //  public String toString() { return "<cont " +
+  //                               id2 + " " + debug_id +
+  //                               " [" + threadable + "] >"; }
+
+  //  public void debug_print(int depth) {
+  //    for (int i = 0; i < depth; i++) System.out.print("  ");
+  //    System.out.println(this);
+  //    if (child != null) child.debug_print(depth+1);
+  //    if (next != null) next.debug_print(depth);
+  //  }
+
+  // Copy the ThreadContainer tree structure down into the underlying
+  // IThreadable objects (that is, make the IThreadable tree look like
+  // the ThreadContainer tree.)
+  //
+  void flush() {
+    if (parent != null && threadable == null)
+      // Only the root_node is allowed to not have a threadable.
+      throw new Error("no threadable in " + this.toString());
+
+    parent = null;
+
+    if (threadable != null)
+      threadable.setChild(child == null ? null : child.threadable);
+
+    if (child != null) {
+      child.flush();
+      child = null;
+    }
+
+    if (threadable != null)
+      threadable.setNext(next == null ? null : next.threadable);
+
+    if (next != null) {
+      next.flush();
+      next = null;
+    }
+
+    threadable = null;
+  }
+
+  // Returns true if child is under self's tree.  This is used for
+  // detecting circularities in the references header.
+  boolean find_child(ThreadContainer target) {
+    if (child == null)
+      return false;
+    else if (child == target)
+      return true;
+    else
+      return child.find_child(target);
+  }
+
+  void reverseChildren() {
+    if (child != null) {
+      // nreverse the children (child through child.next.next.next...)
+      ThreadContainer kid, prev, rest;
+      for (prev = null, kid = child, rest = kid.next;
+           kid != null;
+           prev = kid, kid = rest, rest = (rest == null ? null : rest.next))
+        kid.next = prev;
+      child = prev;
+
+      // then do it for the kids
+      for (kid = child; kid != null; kid = kid.next)
+        kid.reverseChildren();
+    }
+  }
+}

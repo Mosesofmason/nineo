@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<NiNeo>
+    <!--Dont edit this file!-->
+    <Ident Username="newblue" Email="newblue@gmail.com" Signautre="" />
+    <ServerList>
+        <Server Label="localhost" Address="localhost" Port="119" Username="admin" Password="123" />
+        <Server Label="yaako" Address="news.yaako.com" Port="119" Username="" Password="" />
+        <Server Label="心烦服务器" Address="news.newsfan.net" Port="119" Username="" Password="" />
+        <Server Label="希网" Address="news.cn99.com" Port="119" Username="" Password="" />
+        <Server Label="AIOE" Address="news.aioe.com" Port="119" Username="" Password="" />
+    </ServerList>
+    <GroupList>
+        <Group Server="localhost" Name="alt.comp.lang.pascal" />
+        <Group Server="localhost" Name="alt.comp.lang.c" />
+        <Group Server="localhost" Name="alt.comp.shareware.nettamer" />
+        <Group Server="localhost" Name="alt.freewebhosting" />
+        <Group Server="localhost" Name="alt.freewebhosting.support" />
+        <Group Server="news.newsfan.net" Name="生活百科.家用电器" />
+        <Group Server="news.newsfan.net" Name="生活百科.宠物" />
+        <Group Server="news.newsfan.net" Name="生活百科.时尚魅力" />
+        <Group Server="news.newsfan.net" Name="计算机.软件.编程.C语言" />
+        <Group Server="news.yaako.com" Name="cn.fan" />
+        <Group Server="localhost" Name="alt.comp.lang.learn.c-c++" />
+    </GroupList>
+    <Setup />
+</NiNeo>
